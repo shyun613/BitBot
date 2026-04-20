@@ -124,7 +124,7 @@ def _flush_telegram(dry_run: bool = False):
     if not _tg_events:
         return
     prefix = '[DRY] ' if dry_run else ''
-    payload = prefix + '[코인]\n' + '\n'.join(_tg_events)
+    payload = prefix + '[업비트 현물]\n' + '\n'.join(_tg_events)
     try:
         _send_tg(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, payload)
     except Exception as e:

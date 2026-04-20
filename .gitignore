@@ -66,3 +66,24 @@ strategies/cap_defend/research/*.json
 
 # Progress (ephemeral)
 progress.md
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup files
+*.bak
+*.bak_*
+
+# Binance state variants (a1, a2, ...)
+trade/binance_state*.json
+trade/binance_state*.json.lock
+
+# Plan (ephemeral, like progress.md)
+plan.md

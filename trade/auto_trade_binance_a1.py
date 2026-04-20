@@ -46,8 +46,8 @@ from common.notify import send_telegram as _send_tg_common
 # ─── 설정 ───
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, 'config.py')
-STATE_PATH = os.path.join(SCRIPT_DIR, 'binance_state.json')
-LOG_PATH = os.path.join(SCRIPT_DIR, 'binance_trade.log')
+STATE_PATH = os.path.join(SCRIPT_DIR, 'binance_state_a1.json')
+LOG_PATH = os.path.join(SCRIPT_DIR, 'binance_trade_a1.log')
 
 # V21 전략/실행 파라미터 (ENS_fut_L3_k3_12652d57, 2026-04-17 확정)
 # 고정 3배 레버리지, 가드 없음, 4h봉 3멤버 EW 1/3씩
@@ -99,16 +99,10 @@ STRATEGIES = {
     },
 }
 
-# 유니버스 (시총순). 매 매매 사이클마다 CoinGecko top40 + 바이낸스 USDT-M 선물 listing intersect로 동적 갱신.
-# API 실패 시 fallback.
-HARDCODED_UNIVERSE_FALLBACK = [
-    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-    'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT', 'TRXUSDT', 'LINKUSDT',
-    'DOTUSDT', 'UNIUSDT', 'NEARUSDT', 'LTCUSDT', 'BCHUSDT',
-    'APTUSDT', 'ICPUSDT', 'FILUSDT', 'ATOMUSDT', 'ARBUSDT',
-]
+# A1: BTC/ETH/SOL 고정 유니버스 (CoinGecko/exchangeInfo 호출 없음).
+HARDCODED_UNIVERSE_FALLBACK = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
 UNIVERSE: List[str] = list(HARDCODED_UNIVERSE_FALLBACK)
-UNIVERSE_TARGET_SIZE = 40  # CoinGecko top N
+UNIVERSE_TARGET_SIZE = 3  # A1
 COINGECKO_URL = 'https://api.coingecko.com/api/v3/coins/markets'
 STABLECOINS = {'USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'FDUSD', 'USDD', 'PYUSD', 'USDe'}
 
@@ -307,33 +301,10 @@ def fetch_binance_futures_listed(client: Client) -> set:
 
 
 def refresh_universe(client: Client, cache_dir: str = '/tmp') -> List[str]:
-    """CoinGecko top40 + 바이낸스 USDT-M 선물 listing intersect, 시총순 정렬.
-
-    실패 시 HARDCODED_UNIVERSE_FALLBACK 리턴. 글로벌 UNIVERSE도 갱신.
-    """
+    """A1: BTC/ETH/SOL 고정 유니버스. 외부 API 호출 없음."""
     global UNIVERSE
-    cg = fetch_coingecko_top_futures(cache_path=os.path.join(cache_dir, 'binfut_cg_cache.json'))
-    listed = fetch_binance_futures_listed(client)
-    if not cg or not listed:
-        log.warning(f"universe API 실패 (cg={len(cg)} listed={len(listed)}) → fallback")
-        UNIVERSE = list(HARDCODED_UNIVERSE_FALLBACK)
-        return UNIVERSE
-    out: List[str] = []
-    for item in cg:
-        sym = (item.get('symbol') or '').upper()
-        if not sym or sym in STABLECOINS:
-            continue
-        full = sym + 'USDT'
-        if full in listed:
-            out.append(full)
-    if not out:
-        log.warning("universe intersect 비어있음 → fallback")
-        UNIVERSE = list(HARDCODED_UNIVERSE_FALLBACK)
-        return UNIVERSE
-    UNIVERSE = out
-    log.info(f"universe 갱신: {len(out)}개 (cg={len(cg)} listed={len(listed)}) head={out[:5]}")
+    UNIVERSE = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
     return UNIVERSE
-
 
 def fetch_all_data(client: Client) -> Dict[str, Dict[str, pd.DataFrame]]:
     """모든 심볼의 1h, 2h, 4h OHLCV 수집."""
