@@ -1,0 +1,895 @@
+"""compare_daily_report.py 선물(binance_trade.log) 파싱/리포트 테스트.
+
+실행:
+  python3 -m pytest tests/test_compare_daily_report.py -q
+  python3 tests/test_compare_daily_report.py          # pytest 없는 환경 fallback
+
+주의: 텔레그램 발송 경로(main / send_telegram)는 절대 타지 않는다.
+      파싱/리포트 빌드 함수만 직접 호출하고, common.notify 는 스텁으로 갈아끼운다.
+"""
+import importlib.util
+import os
+import sys
+import types
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE)
+_SCRIPT = os.path.join(_REPO, 'scripts', 'compare_daily_report.py')
+
+
+def _load_module():
+    """common.notify / config 스텁을 먼저 심고 스크립트를 모듈로 로드한다.
+
+    스크립트 top-level 이 common.notify 를 import 하고 그쪽이 requests 를 요구하므로
+    스텁 없이는 import 자체가 실패할 수 있다.
+    """
+    if 'common' not in sys.modules:
+        pkg = types.ModuleType('common')
+        pkg.__path__ = []  # 패키지처럼 보이게
+        sys.modules['common'] = pkg
+    notify = types.ModuleType('common.notify')
+
+    def _never_send(*args, **kwargs):  # pragma: no cover - 호출되면 테스트 설계 오류
+        raise AssertionError('테스트에서 텔레그램 발송이 호출됐다')
+
+    notify.send_telegram = _never_send
+    sys.modules['common.notify'] = notify
+
+    cfg = types.ModuleType('config')
+    cfg.TELEGRAM_BOT_TOKEN = 'bot000:STUB-NOT-A-REAL-TOKEN'
+    cfg.TELEGRAM_CHAT_ID = '0'
+    sys.modules['config'] = cfg
+
+    spec = importlib.util.spec_from_file_location('compare_daily_report_under_test', _SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+cdr = _load_module()
+
+DAY = '2026-08-31'
+
+# 2026-08-31 오라클 dry-run cron 실제 블록 (원문 그대로)
+SAMPLE_BLOCK = """2026-08-31 09:05:32,177 INFO cash_buffer (fut): 2%
+2026-08-31 09:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=20260831_090532) ===
+2026-08-31 09:05:33,234 INFO universe 갱신: 24개 (cg=40 listed=525) head=['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT']
+2026-08-31 09:05:33,234 INFO 데이터 수집...
+2026-08-31 09:05:43,878 INFO BTC D spot override OK (last close=78,508)
+2026-08-31 09:05:43,879 INFO 수집 완료: 1h 24개, D 24개 (11.7s)
+2026-08-31 09:05:44,057 INFO 현재 PV: $0.00
+2026-08-31 09:05:44,058 INFO   D_SMA42 → {'BTC': '33.3%', 'ETH': '33.3%'} (cash=33%)
+2026-08-31 09:05:44,058 INFO 합산: {'BTC': '33.3%', 'ETH': '33.3%'}
+2026-08-31 09:05:44,058 INFO V24 drift eval: ht=0.6600 threshold=0.03 fire=True enabled=True data_ok=True
+2026-08-31 09:05:44,058 INFO refill v2 fut: 시작. strategies=1
+2026-08-31 09:05:44,120 INFO   🔁 V24 refill v2 적용: {'BTC': '33.3%', 'ETH': '33.3%'} | top diffs=[]
+2026-08-31 09:05:44,120 INFO   BTC_cap: prev_close=$77,682.00 SMA42=$67,927.56 ratio=1.1436 → L=4
+2026-08-31 09:05:44,121 INFO   K2[BTC]: prev_close=77682.0000 SMA7=78651.8700 ratio=0.9877 → L=2
+2026-08-31 09:05:44,121 INFO   BTC → final L = min(BTC_cap=4, K2=2) = 2
+2026-08-31 09:05:44,121 INFO   K2[ETH]: prev_close=2415.5500 SMA7=2464.5857 ratio=0.9801 → L=2
+2026-08-31 09:05:44,121 INFO   ETH → final L = min(BTC_cap=4, K2=2) = 2
+2026-08-31 09:05:44,121 INFO DRY-RUN REBALANCE: {'BTC': '33.3%', 'ETH': '33.3%'}
+2026-08-31 09:05:44,143 INFO === 완료 (12.0s) ===
+"""
+
+
+def _write(tmp_path, text, name='binance_trade.log'):
+    p = os.path.join(str(tmp_path), name)
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write(text)
+    return p
+
+
+def _fut(tmp_path, text):
+    r = cdr.FutResult('선물', _write(tmp_path, text))
+    r.parse(DAY)
+    return r
+
+
+def _approx(a, b, tol=1e-6):
+    return abs(a - b) <= tol
+
+
+# ─────────────────────────── (a) 실제 블록 파싱 ───────────────────────────
+def test_fut_parses_real_dry_run_block(tmp_path):
+    r = _fut(tmp_path, SAMPLE_BLOCK)
+
+    assert r.ran is True
+    assert r.run_time == '09:05:32'          # 블록 시작 = '매매 시작' 줄
+    assert r.run_id == '20260831_090532'
+    assert r.start_count == 1
+    assert r.dry_run is True and r.mode_str() == 'dry'
+    assert r.pv == 0.0
+
+    # 합산 목표: cash 는 1-합 으로 채운다
+    assert sorted(r.combined) == ['BTC', 'Cash', 'ETH']
+    assert _approx(r.combined['BTC'], 0.333)
+    assert _approx(r.combined['ETH'], 0.333)
+    assert _approx(r.combined['Cash'], 0.334)
+
+    # 전략별 목표 (cash 는 로그 값 그대로)
+    assert set(r.members) == {'D_SMA42'}
+    assert _approx(r.members['D_SMA42']['BTC'], 0.333)
+    assert _approx(r.members['D_SMA42']['Cash'], 0.33)
+
+    # 심볼별 최종 레버리지 (BTC_cap / K2 중간 줄에 낚이면 안 된다)
+    assert r.leverage == {'BTC': 2, 'ETH': 2}
+
+    # 카나리 로그가 없는 날 → 타겟 추론
+    assert r.canary == {'D_SMA42': 'ON'}
+    assert r.canary_source == '타겟 추론'
+
+    assert (r.result_kind, r.result_label) == ('ok', '정상 완료')
+    assert r.issues == []
+
+    tgt = r.target_str()
+    assert 'BTC 33.3% (L2)' in tgt and 'ETH 33.3% (L2)' in tgt and 'cash 33.4%' in tgt
+
+
+def test_fut_explicit_canary_line_wins(tmp_path):
+    log = (
+        "2026-08-31 09:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 09:05:42,137 INFO   D_SMA42 BTC=$77,682 SMA(42)=$67,928 ratio=1.1436"
+        " canary=ON  *** FLIPPED ***\n"
+        "2026-08-31 09:05:44,058 INFO   D_SMA42 → {'BTC': '33.3%'} (cash=67%)\n"
+        "2026-08-31 09:05:44,058 INFO 합산: {'BTC': '33.3%'}\n"
+        "2026-08-31 09:05:44,121 INFO DRY-RUN REBALANCE: {'BTC': '33.3%'}\n"
+        "2026-08-31 09:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.canary == {'D_SMA42': 'ON'}
+    assert r.canary_source == 'canary 로그'
+
+
+def test_fut_live_mode_detected(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:41,000 INFO 현재 PV: $100.00\n"
+        "2026-08-31 00:05:44,058 INFO 합산: {'BTC': '33.3%'}\n"
+        "2026-08-31 00:05:45,000 INFO ORDER BUY BTCUSDT qty=0.010: NEW\n"
+        "2026-08-31 00:05:46,000 INFO 리밸런싱 완료: PV $100.00 → $101.50\n"
+        "2026-08-31 00:05:47,000 INFO === 완료 (15.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.dry_run is False and r.mode_str() == 'LIVE'
+    assert (r.result_kind, r.result_label) == ('ok', '리밸런싱 완료')
+    assert r.pv == 101.50   # 실거래면 리밸런싱 '후' PV 가 최종값
+
+
+# ─────────────────── (b) 하루 2회 실행 → 마지막 블록 ────────────────────
+def test_fut_uses_last_block_of_the_day(tmp_path):
+    earlier = (
+        "2026-08-31 02:06:32,478 INFO === 바이낸스 선물 매매 시작 (run_id=20260831_020632) ===\n"
+        "2026-08-31 02:06:32,809 WARNING market cache 없음 binance_universe_cache.json\n"
+        "2026-08-31 02:06:42,152 INFO   D_SMA42 → {'XRP': '50.0%'} (cash=50%)\n"
+        "2026-08-31 02:06:42,152 INFO 합산: {'XRP': '50.0%'}\n"
+        "2026-08-31 02:06:42,160 INFO DRY-RUN REBALANCE: {'XRP': '50.0%'}\n"
+        "2026-08-31 02:06:42,181 INFO === 완료 (9.7s) ===\n"
+    )
+    # 전날 기록도 같은 파일에 남아 있다 (로테이션 없음) — 날짜 필터가 걸러야 한다
+    prev_day = (
+        "2026-08-30 09:05:00,000 INFO === 바이낸스 선물 매매 시작 (run_id=20260830_090500) ===\n"
+        "2026-08-30 09:05:01,000 INFO 합산: {'DOGE': '99.0%'}\n"
+        "2026-08-30 09:05:02,000 INFO === 완료 (2.0s) ===\n"
+    )
+    r = _fut(tmp_path, prev_day + earlier + SAMPLE_BLOCK)
+
+    assert r.start_count == 2                      # 그 날 시작 횟수 (전날 제외)
+    assert r.run_id == '20260831_090532'           # 마지막 블록
+    assert r.run_time == '09:05:32'
+    assert sorted(r.coins()) == ['BTC', 'ETH']     # 앞 블록의 XRP 가 섞이면 안 된다
+    assert r.issues == []                          # 앞 블록의 WARNING 도 새면 안 된다
+
+
+# ───────────────────────── (c) CASH only ─────────────────────────
+def test_fut_cash_only_empty_dict(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:41,207 INFO 현재 PV: $1,234.56\n"
+        "2026-08-31 00:05:42,000 INFO   D_SMA42 → CASH 100% (cash=100%)\n"
+        "2026-08-31 00:05:42,001 INFO 합산: {}\n"
+        "2026-08-31 00:05:42,002 INFO DRY-RUN REBALANCE: CASH\n"
+        "2026-08-31 00:05:42,283 INFO === 완료 (10.1s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.coins() == {}
+    assert _approx(r.combined['Cash'], 1.0)
+    assert r.canary == {'D_SMA42': 'OFF'}
+    assert r.canary_source == '타겟 추론'
+    assert r.pv == 1234.56
+    assert r.target_str() == 'CASH only (cash 100.0%)'
+
+
+def test_fut_cash_only_legacy_text(tmp_path):
+    """구형 로그의 '합산: CASH 100%' 도 CASH only 로 읽힌다."""
+    log = (
+        "2026-08-31 00:05:31,048 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:31,207 INFO   4h_S240_SN120 BTC=$77,377 SMA(240)=$78,016"
+        " ratio=0.9918 canary=OFF\n"
+        "2026-08-31 00:05:31,207 INFO   4h_S240_SN120 → CASH 100% (cash=100%)\n"
+        "2026-08-31 00:05:31,208 INFO 합산: CASH 100%\n"
+        "2026-08-31 00:05:31,208 INFO DRY-RUN REBALANCE: CASH\n"
+        "2026-08-31 00:05:32,283 INFO === 완료 (22.9s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.coins() == {}
+    assert _approx(r.combined['Cash'], 1.0)
+    assert r.canary == {'4h_S240_SN120': 'OFF'}
+    assert r.canary_source == 'canary 로그'
+
+
+# ──────────── (d) WARNING/ERROR 수집 + high-watermark 분류 ────────────
+def test_fut_collects_issues_and_classifies_error(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:32,809 WARNING market cache 없음 binance_universe_cache.json\n"
+        "2026-08-31 00:05:32,810 WARNING market cache 없음 binance_universe_cache.json\n"
+        "2026-08-31 00:05:33,000 INFO 수집 완료: 1h 24개, D 24개 (0.8s)\n"
+        "2026-08-31 00:05:33,100 ERROR BTC 데이터 누락! 매매 중단. 이전 포지션 유지.\n"
+        "2026-08-31 00:05:33,200 INFO === 완료 (1.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+
+    # '=== 완료'(ok) 가 뒤에 와도 error 가 유지된다 (high-watermark)
+    assert (r.result_kind, r.result_label) == ('error', '매매 중단')
+    assert len(r.issues) == 2                      # 중복 제거
+    assert r.issues[0].startswith('ERROR BTC 데이터 누락')       # ERROR 우선 (M3)
+    assert r.issues[1].startswith('WARNING market cache 없음')
+    assert r.issue_omitted == 0
+
+
+def test_fut_issue_dedup_limit_and_truncation(tmp_path):
+    long_tail = 'x' * 200
+    lines = ["2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"]
+    for i in range(7):
+        lines.append(f"2026-08-31 00:05:33,{100+i:03d} WARNING 경고{i} {long_tail}\n")
+    lines.append("2026-08-31 00:05:34,000 INFO === 완료 (2.0s) ===\n")
+    r = _fut(tmp_path, ''.join(lines))
+
+    assert len(r.issues) == cdr.FUT_ISSUE_LIMIT == 5
+    assert r.issue_omitted == 2
+    body = r.issues[0][len('WARNING '):]
+    assert len(body) == cdr.FUT_ISSUE_MAXLEN and body.endswith('…')
+
+
+def test_fut_abort_and_lock_are_errors(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:32,300 ERROR V25 ABORT: lock 활성 — abort_streak=3. 수동 해제 필요\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.result_kind == 'error'
+    assert 'ABORT' in r.result_label
+
+
+def test_fut_warn_marker_position_query_failure(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,000 ERROR 현재 포지션/PV 조회 실패. 이번 실행은 거래 없이 스킵.\n"
+    )
+    r = _fut(tmp_path, log)
+    assert (r.result_kind, r.result_label) == ('warn', '포지션/PV 조회 실패')
+
+    # 리밸런싱 후 조회 실패도 같은 warn 등급
+    r2 = _fut(tmp_path, (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:40,000 ERROR 리밸런싱 후 포지션 조회 실패. kill-switch/미달 판정 없이 종료.\n"
+    ))
+    assert (r2.result_kind, r2.result_label) == ('warn', '포지션 조회 실패')
+
+
+def test_fut_started_but_never_finished_is_unknown(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,234 INFO 데이터 수집...\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.ran is True
+    assert r.result_kind == 'unknown'
+    assert '결과 마커 없음' in r.result_label
+
+
+# ──────────────────────── (e) 미실행 처리 ────────────────────────
+def test_fut_missing_log_file(tmp_path):
+    r = cdr.FutResult('선물', os.path.join(str(tmp_path), 'nope.log'))
+    r.parse(DAY)
+    assert r.ran is False and r.log_exists is False
+    assert any('로그 파일 없음' in p for p in r.problems)
+    lines, warn = cdr._fut_lines(r)
+    assert warn is True and '미실행' in lines[0]
+
+
+def test_fut_no_record_for_the_day(tmp_path):
+    r = _fut(tmp_path, "2026-08-30 09:05:00,000 INFO === 바이낸스 선물 매매 시작 (run_id=R0) ===\n")
+    assert r.ran is False and r.log_exists is True
+    assert any('실행 기록 없음' in p for p in r.problems)
+
+
+def test_fut_partial_record_without_start(tmp_path):
+    r = _fut(tmp_path, "2026-08-31 00:05:32,300 ERROR V25 ABORT: lock 활성 — 수동 해제 필요\n")
+    assert r.ran is False
+    assert any('실행 시작 로그 없음' in p for p in r.problems)
+    assert r.abort_hints  # 원인 후보를 남긴다
+
+
+# ──────────────────── (f) build_report 통합 ────────────────────
+SPOT_LOG = """[{day} 00:05:10] [{rid}] Executor 시작 (dry_run=True)
+[{day} 00:05:11] [{rid}] combined target: BTC:33.3%, ETH:33.3% (cash=33.4%)
+[{day} 00:05:20] [{rid}] 거래 완료
+"""
+
+
+def _spot_sides(tmp_path):
+    sides = []
+    for name, fname in (('업비트', 'executor_coin.log'), ('바낸현물', 'executor_coin_binance.log')):
+        path = _write(tmp_path, SPOT_LOG.format(day=DAY, rid='0005abcd'), fname)
+        s = cdr.SideResult(name, path)
+        s.parse(DAY)
+        sides.append(s)
+    return sides
+
+
+def test_build_report_has_three_sections_and_spot_compare(tmp_path):
+    sides = _spot_sides(tmp_path)
+    fut = _fut(tmp_path, SAMPLE_BLOCK)
+    body, warn = cdr.build_report(DAY, sides, fut)
+
+    assert body.startswith('📊 일일 운용 리포트 2026-08-31 (KST 기준)')
+    assert '[업비트]' in body and '[바낸현물]' in body and '[선물]' in body
+    assert '\n── 현물 비교 ──' in body        # 헤더 변경
+    assert '\n── 비교 ──' not in body         # 옛 헤더는 남지 않는다
+    # 현물 비교 로직은 그대로 — 선물이 끼어들지 않는다
+    assert '✅ 실행 쌍 정합' in body
+    assert '✅ 코인 집합 일치' in body
+    assert '✅ 비중 일치' in body
+    # 선물 블록 내용
+    assert 'run=20260831_090532' in body
+    assert 'BTC 33.3% (L2)' in body
+    assert 'PV: $0.00' in body
+    assert warn is False
+
+
+def test_build_report_warns_when_fut_errors(tmp_path):
+    sides = _spot_sides(tmp_path)
+    fut = _fut(tmp_path, (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,100 ERROR BTC 데이터 누락! 매매 중단. 이전 포지션 유지.\n"
+    ))
+    body, warn = cdr.build_report(DAY, sides, fut)
+    assert warn is True
+    assert '🚨 매매 중단' in body
+
+    rendered = (cdr.WARN_HEADER + '\n' + body) if warn else body   # main() 과 같은 조립
+    assert rendered.startswith('⚠️ 점검 필요')
+
+
+def test_build_report_warns_when_fut_missing(tmp_path):
+    sides = _spot_sides(tmp_path)
+    fut = cdr.FutResult('선물', os.path.join(str(tmp_path), 'nope.log'))
+    fut.parse(DAY)
+    body, warn = cdr.build_report(DAY, sides, fut)
+    assert warn is True
+    assert '[선물] ⚠️ 미실행' in body
+
+
+def test_build_report_without_fut_is_backward_compatible(tmp_path):
+    sides = _spot_sides(tmp_path)
+    body, warn = cdr.build_report(DAY, sides)
+    assert '[선물]' not in body
+    assert '\n── 현물 비교 ──' in body
+    assert warn is False
+
+
+# ──────────────────── (g) 멀티라인 메시지 ────────────────────
+def test_fut_multiline_message_is_joined(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,000 ERROR 치명 오류: Traceback (most recent call last):\n"
+        '  File "auto_trade_binance.py", line 3210, in main\n'
+        "    execute_rebalance(client, combined, pv)\n"
+        "ValueError: boom\n"
+        "2026-08-31 00:05:34,000 INFO === 완료 (2.0s) ===\n"
+    )
+    path = _write(tmp_path, log)
+    recs = cdr._read_fut_records(path, DAY)
+    assert len(recs) == 3                                  # 3 레코드로 병합
+    ts, level, msg = recs[1]
+    assert (ts, level) == ('00:05:33', 'ERROR')
+    assert 'ValueError: boom' in msg and msg.count('\n') == 3
+
+    r = cdr.FutResult('선물', path)
+    r.parse(DAY)
+    assert (r.result_kind, r.result_label) == ('error', '치명 오류')
+    # 이슈는 첫 줄만 싣는다 (traceback 본문으로 리포트가 넘치면 안 된다)
+    assert r.issues == ['ERROR 치명 오류: Traceback (most recent call last):']
+
+
+# ═══════════ Codex 리뷰 라운드 1 반영분 (C1~m2) ═══════════
+
+# ── C1: 최종 타겟 권위 체인 ──
+def test_c1_refill_overrides_stale_combined_and_dryrun(tmp_path):
+    """refill 로 종목이 교체된 날 stale 타겟(합산/DRY-RUN)을 보고하면 안 된다.
+
+    executor 실코드(auto_trade_binance.py:2798,3185): coins_combined 는 refill '전'에
+    한 번 만들어지고 'DRY-RUN REBALANCE' 가 그걸 그대로 재사용한다 → DRY-RUN 줄은
+    refill 을 덮으면 안 된다(코디네이터 초안의 순서와 반대).
+    """
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:44,058 INFO   D_SMA42 → {'BTC': '33.3%', 'ETH': '33.3%'} (cash=33%)\n"
+        "2026-08-31 00:05:44,058 INFO 합산: {'BTC': '33.3%', 'ETH': '33.3%'}\n"
+        "2026-08-31 00:05:44,120 INFO   🔁 V24 refill v2 적용: {'BTC': '33.3%', 'SOL': '33.3%'}"
+        " | top diffs=[('SOL', '+33.3%'), ('ETH', '-33.3%')]\n"
+        "2026-08-31 00:05:44,121 INFO   BTC → final L = min(BTC_cap=4, K2=2) = 2\n"
+        "2026-08-31 00:05:44,121 INFO   SOL → final L = min(BTC_cap=4, K2=3) = 3\n"
+        # stale 사본 — refill 결과를 덮으면 안 된다
+        "2026-08-31 00:05:44,121 INFO DRY-RUN REBALANCE: {'BTC': '33.3%', 'ETH': '33.3%'}\n"
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert sorted(r.coins()) == ['BTC', 'SOL']
+    assert 'ETH' not in r.combined
+    assert r.target_rank == cdr.FUT_TGT_REFILL
+    assert r.target_src_str() == ' (refill v2 반영)'
+    assert 'SOL 33.3% (L3)' in r.target_str()
+
+    lines, warn = cdr._fut_lines(r)
+    body = '\n'.join(lines)
+    assert 'SOL' in body and 'ETH' not in body
+    assert warn is False
+
+
+def test_c1_v25_fut_targets_is_final_authority(tmp_path):
+    """실거래 전용 'V25 fut: targets=' (executor:3216/3356, float dict) 가 최종 확정값."""
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:32,200 INFO 시작 지연: 17s (크론 동시충돌 완화)\n"
+        "2026-08-31 00:05:44,058 INFO 합산: {'BTC': '33.3%', 'ETH': '33.3%'}\n"
+        "2026-08-31 00:05:44,120 INFO   🔁 V24 refill v2 적용: {'BTC': '33.3%', 'SOL': '33.3%'}"
+        " | top diffs=[]\n"
+        "2026-08-31 00:05:46,000 INFO 리밸런싱 완료: PV $100.00 → $101.00\n"
+        "2026-08-31 00:05:47,000 INFO V25 fut: targets={'BTC': 0.5, 'Cash': 0.5} ht=0.1000"
+        " fire=True pv=$101.00 success=True streak=0\n"
+        "2026-08-31 00:05:47,100 INFO === 완료 (15.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.target_rank == cdr.FUT_TGT_V25
+    assert sorted(r.coins()) == ['BTC']
+    assert _approx(r.combined['BTC'], 0.5) and _approx(r.combined['Cash'], 0.5)
+    assert r.target_src_str() == ' (실거래 확정)'
+    assert r.dry_run is False
+
+
+def test_c1_dryrun_line_used_when_combined_missing(tmp_path):
+    """'합산:' 이 없을 때는 DRY-RUN 줄이라도 쓴다 (권위는 낮지만 유일한 근거)."""
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:44,121 INFO DRY-RUN REBALANCE: {'BTC': '50.0%'}\n"
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.target_rank == cdr.FUT_TGT_DRYRUN
+    assert _approx(r.combined['BTC'], 0.5)
+    assert r.target_src_str() == ''      # 합산과 같은 값이라 출처 표기 안 함
+
+
+# ── C2: 결과 분류 보강 ──
+def test_c2_order_failed_survives_later_success_markers(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:32,200 INFO 시작 지연: 5s (크론 동시충돌 완화)\n"
+        "2026-08-31 00:05:45,000 ERROR ORDER FAILED BUY BTCUSDT qty=0.010: APIError(code=-2010)\n"
+        "2026-08-31 00:05:46,000 INFO 리밸런싱 완료: PV $100.00 → $99.00\n"
+        "2026-08-31 00:05:47,000 INFO === 완료 (15.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert (r.result_kind, r.result_label) == ('error', 'ORDER FAILED (주문 실패)')
+
+
+def test_c2_integrity_violation_and_reconciliation(tmp_path):
+    integ = _fut(tmp_path, (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,000 ERROR 🔒 V25 무결성 위반 — 매매 차단\n"
+        "  - BTCUSDT qty 0.010 → 0.004\n"
+        "2026-08-31 00:05:34,000 INFO === 완료 (2.0s) ===\n"
+    ))
+    assert integ.result_kind == 'error'
+    assert '무결성 위반' in integ.result_label
+
+    recon = _fut(tmp_path, (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:32,200 INFO 시작 지연: 5s (크론 동시충돌 완화)\n"
+        "2026-08-31 00:05:33,000 WARNING ⚠ V25 reconciliation 차이:\n"
+        "  - BTCUSDT notional 100.0 vs 80.0\n"
+        "2026-08-31 00:05:34,000 INFO === 완료 (2.0s) ===\n"
+    ))
+    assert (recon.result_kind, recon.result_label) == ('warn', 'reconciliation 차이 (체결 미달)')
+
+
+def test_c2_v25_success_false_is_error(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:32,200 INFO 시작 지연: 5s (크론 동시충돌 완화)\n"
+        "2026-08-31 00:05:47,000 INFO V25 fut: targets={'Cash': 1.0} ht=0.0 fire=False"
+        " pv=$100.00 success=False streak=1\n"
+        "2026-08-31 00:05:47,100 INFO === 완료 (15.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.result_kind == 'error'
+    assert 'success=False' in r.result_label
+
+
+def test_c2_unmatched_error_level_promotes_result(tmp_path):
+    """마커가 모르는 ERROR 줄이 있으면 '정상 완료' 로 남지 않는다."""
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,000 ERROR 알 수 없는 내부 오류 zzz\n"
+        "2026-08-31 00:05:34,000 INFO DRY-RUN REBALANCE: CASH\n"
+        "2026-08-31 00:05:34,100 INFO === 완료 (2.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert (r.result_kind, r.result_label) == ('error', '오류 로그 있음 (마커 미분류)')
+
+    # 반대로 마커가 의도적으로 warn 으로 분류한 줄은 레벨(ERROR)이 덮지 않는다
+    r2 = _fut(tmp_path, (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,000 ERROR 현재 포지션/PV 조회 실패. 이번 실행은 거래 없이 스킵.\n"
+    ))
+    assert r2.result_kind == 'warn'
+
+
+# ── C3: weights 파싱 fail-loud ──
+def test_c3_double_quoted_dict_fails_loud(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        '2026-08-31 00:05:44,058 INFO 합산: {"BTC": "33.3%"}\n'
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.combined == {}                       # 조용히 CASH-only 로 만들지 않는다
+    assert r.target_str() == '알 수 없음'
+    assert r.canary_str() == '알 수 없음'         # 근거 없는 추론 금지
+    assert any('타겟 파싱 실패' in p for p in r.problems)
+    assert r.result_kind == 'warn'
+    body = '\n'.join(cdr._fut_lines(r)[0])
+    assert '⚠️ 타겟 파싱 실패: {"BTC": "33.3%"}' in body      # 원문을 그대로 보여준다
+
+
+def test_c3_missing_percent_sign_fails_loud(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:44,058 INFO 합산: {'BTC': '33.3'}\n"
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.combined == {}
+    assert r.result_kind == 'warn'
+    assert any('타겟 파싱 실패' in p for p in r.problems)
+
+
+def test_c3_partial_token_match_fails_loud(tmp_path):
+    """항목 2개 중 1개만 토큰으로 잡히면(부분 매칭) 종목을 놓친 것이다."""
+    assert cdr._parse_fut_weights("{'BTC': '33.3%', 'ETH': 'n/a'}") is None
+    assert cdr._parse_fut_weights("{'BTC': '150.0%'}") is None          # 범위 위반
+    assert cdr._parse_fut_weights("{'BTC': '60.0%', 'ETH': '60.0%'}") is None  # 합 > 1
+    assert cdr._parse_fut_weights('{}') == {'Cash': 1.0}
+    assert cdr._parse_fut_weights('CASH 100%') == {'Cash': 1.0}
+    assert cdr._parse_fut_weights('CASH') == {'Cash': 1.0}
+    assert cdr._parse_fut_weights('CASH 100') is None
+    assert cdr._parse_fut_floats("{'BTC': 0.5, 'Cash': 0.5}")['BTC'] == 0.5
+    assert cdr._parse_fut_floats("{'BTC': abc}") is None
+
+
+# ── M1: 블록 경계 ──
+def test_m1_block_closes_at_done_marker(tmp_path):
+    """'=== 완료' 뒤의 별도 실행(수동 --report 등) 로그는 블록 분류에 안 섞인다."""
+    log = SAMPLE_BLOCK + (
+        "2026-08-31 10:00:00,000 ERROR 리포트 생성 중 포지션 조회 실패\n"
+        "2026-08-31 10:00:01,000 WARNING 뭔가 경고\n"
+    )
+    r = _fut(tmp_path, log)
+    assert (r.result_kind, r.result_label) == ('ok', '정상 완료')   # 블록은 그대로 ok
+    assert r.issues == []
+    assert r.outside_note.startswith('블록 외 로그 2건')
+    assert 'ERROR 1' in r.outside_note and 'WARNING 1' in r.outside_note
+    body = '\n'.join(cdr._fut_lines(r)[0])
+    assert '블록 외 로그 2건' in body
+
+
+def test_m1_start_marker_anchored_to_first_line(tmp_path):
+    """멀티라인 본문에 시작/완료 문자열이 섞여도 블록 경계로 오인하지 않는다."""
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,000 ERROR 예외 발생\n"
+        "  이전 로그 재현: === 바이낸스 선물 매매 시작 (run_id=FAKE) ===\n"
+        "  이전 로그 재현: === 완료 (0.1s) ===\n"
+        "2026-08-31 00:05:34,000 INFO DRY-RUN REBALANCE: CASH\n"
+        "2026-08-31 00:05:34,100 INFO === 완료 (2.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.start_count == 1
+    assert r.run_id == 'R1'
+    assert r.outside_note == ''          # 진짜 완료는 마지막 줄 하나뿐
+    assert r.result_kind == 'error'      # 마커 미분류 ERROR 승격
+
+
+# ── M2: redaction ──
+def test_m2_issue_lines_are_redacted(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,000 WARNING 텔레그램 실패 bot123456:ABC-token"
+        " https://api.telegram.org/bot123456:ABC-token/sendMessage\n"
+        "2026-08-31 00:05:34,000 INFO DRY-RUN REBALANCE: CASH\n"
+        "2026-08-31 00:05:34,100 INFO === 완료 (2.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert len(r.issues) == 1
+    assert 'bot<REDACTED>' in r.issues[0]
+    assert 'ABC-token' not in r.issues[0]
+    assert 'bot123456' not in '\n'.join(cdr._fut_lines(r)[0])
+
+
+def test_m2_target_parse_error_is_redacted(tmp_path):
+    r = _fut(tmp_path, (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        '2026-08-31 00:05:44,058 INFO 합산: {"BTC": "33.3%"} bot999999:SECRET\n'
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    ))
+    joined = '\n'.join(r.problems)
+    assert 'SECRET' not in joined and 'bot<REDACTED>' in joined
+
+
+# ── M3: 이슈 절단 우선순위 ──
+def test_m3_errors_survive_issue_truncation(tmp_path):
+    lines = ["2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"]
+    for i in range(5):
+        lines.append(f"2026-08-31 00:05:33,{100+i:03d} WARNING 경고{i} 어쩌구\n")
+    lines.append("2026-08-31 00:05:33,900 ERROR 알 수 없는 내부 오류 zzz\n")
+    lines.append("2026-08-31 00:05:34,000 INFO DRY-RUN REBALANCE: CASH\n")
+    lines.append("2026-08-31 00:05:34,100 INFO === 완료 (2.0s) ===\n")
+    r = _fut(tmp_path, ''.join(lines))
+
+    assert len(r.issues) == 5
+    assert r.issues[0].startswith('ERROR 알 수 없는 내부 오류')   # ERROR 먼저 보존
+    assert all(x.startswith('WARNING') for x in r.issues[1:])
+    assert [x for x in r.issues if x.startswith('WARNING')] == [
+        f'WARNING 경고{i} 어쩌구' for i in range(4)]              # 같은 등급 내 시간순
+    assert r.issue_omitted == 1
+    assert r.issue_omitted_by_level == {'WARNING': 1}
+    assert r.result_kind == 'error'                              # 분류는 절단 전 전체 기준
+    assert '외 1건(WARNING 1)' in '\n'.join(cdr._fut_lines(r)[0])
+
+
+# ── m1: 힌트 보강 / 모드 판정 ──
+def test_m1_abort_hints_from_executor_wordings(tmp_path):
+    lock = _fut(tmp_path, "2026-08-31 00:05:00,000 WARNING 다른 인스턴스 실행 중, 종료\n")
+    assert lock.ran is False
+    assert 'flock 충돌로 스킵' in lock.abort_hints
+
+    key = _fut(tmp_path, "2026-08-31 00:05:00,000 ERROR API key not configured\n")
+    assert 'API 키 미설정' in key.abort_hints
+
+
+def test_m1_quiet_dry_run_without_dryrun_line(tmp_path):
+    """rebalancing_needed=false 인 dry-run 은 'DRY-RUN REBALANCE' 를 안 찍는다.
+
+    실코드(2963): 그 경로는 '매매 스킵: rebalancing_needed=false' 만 남긴다.
+    실거래라면 '시작 지연:' 이 반드시 있으므로, 그게 없이 완주했으면 dry 로 본다.
+    """
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:44,058 INFO 합산: {'BTC': '33.3%'}\n"
+        "2026-08-31 00:05:44,100 INFO 매매 스킵: rebalancing_needed=false\n"
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.dry_run is True and r.mode_source == '추론'
+    assert r.mode_str() == 'dry·추론'
+    assert (r.result_kind, r.result_label) == ('ok', '매매 불필요 → 스킵')
+
+    live = _fut(tmp_path, log.replace(
+        "2026-08-31 00:05:44,058 INFO 합산:",
+        "2026-08-31 00:05:32,200 INFO 시작 지연: 12s (크론 동시충돌 완화)\n"
+        "2026-08-31 00:05:44,058 INFO 합산:"))
+    assert live.dry_run is False and live.mode_str() == 'LIVE'
+
+
+def test_m1_unknown_mode_promotes_to_warn(tmp_path):
+    """분류는 됐는데 dry/LIVE 판별이 안 되면 최소 warn."""
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,000 INFO 리밸런싱 완료: PV $1.00 → $1.00\n"
+    )
+    r = _fut(tmp_path, log)          # '=== 완료' 없음 → 추론도 불가
+    assert r.dry_run is False        # '리밸런싱 완료' 는 LIVE 흔적
+    r2 = _fut(tmp_path, (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,000 INFO 매매 스킵: rebalancing_needed=false\n"
+    ))
+    assert r2.dry_run is None and r2.mode_str() == '?'
+    assert r2.result_kind == 'warn' and '모드 불명' in r2.result_label
+
+
+# ── m2: 스트리밍 리더 ──
+def test_m2_reader_streams_and_keeps_semantics(tmp_path):
+    """파일을 통째로 읽지 않고 라인 순회 — 결과는 동일해야 한다."""
+    import inspect
+    src = inspect.getsource(cdr._read_fut_records)
+    assert 'read().splitlines()' not in src
+    assert 'for line in f' in src
+
+    path = _write(tmp_path, SAMPLE_BLOCK * 3)
+    recs = cdr._read_fut_records(path, DAY)
+    assert len(recs) == 19 * 3
+    assert recs[0][1] == 'INFO'
+
+
+# ═══════════ Codex 리뷰 라운드 2 반영분 (R2-1~R2-3) ═══════════
+
+# ── R2-1: 상위 권위 파싱 실패는 하위 권위 값을 무효화한다 ──
+def test_r2_1_broken_higher_rank_invalidates_accepted_target(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:32,200 INFO 시작 지연: 5s (크론 동시충돌 완화)\n"
+        "2026-08-31 00:05:44,058 INFO 합산: {'BTC': '33.3%', 'ETH': '33.3%'}\n"
+        "2026-08-31 00:05:44,120 INFO   🔁 V24 refill v2 적용: {'BTC': '33.3%', 'SOL': '33.3%'}"
+        " | top diffs=[]\n"
+        # 최종 확정 줄이 깨졌다 → refill 값도 '최종' 이라 믿을 수 없다
+        "2026-08-31 00:05:47,000 INFO V25 fut: targets={\"BTC\": 0.5} ht=0.1000 fire=True"
+        " pv=$1.00 success=True streak=0\n"
+        "2026-08-31 00:05:47,100 INFO === 완료 (15.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.combined == {}
+    assert r.target_rank == -1
+    assert r.target_blocked_rank == cdr.FUT_TGT_V25
+    assert r.target_str() == '알 수 없음'
+    assert r.result_kind == 'warn'
+    assert any('타겟 파싱 실패' in p for p in r.problems)
+    assert cdr._fut_lines(r)[1] is True
+
+
+def test_r2_1_lower_rank_failure_recovers_from_higher_rank(tmp_path):
+    """깨진 합산(rank0) → 정상 refill(rank2) 이면 refill 값으로 복구된다."""
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        '2026-08-31 00:05:44,058 INFO 합산: {"BTC": "33.3%"}\n'
+        "2026-08-31 00:05:44,120 INFO   🔁 V24 refill v2 적용: {'BTC': '33.3%', 'SOL': '33.3%'}"
+        " | top diffs=[]\n"
+        "2026-08-31 00:05:44,121 INFO DRY-RUN REBALANCE: {'BTC': '33.3%'}\n"
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert sorted(r.coins()) == ['BTC', 'SOL']       # refill 로 복구
+    assert r.target_rank == cdr.FUT_TGT_REFILL
+    assert r.result_kind == 'warn'                   # 실패 사실은 남는다
+    assert any('타겟 파싱 실패' in p for p in r.problems)
+
+
+def test_r2_1_same_rank_later_good_line_recovers(tmp_path):
+    """같은 rank 의 뒤 정상 줄은 복구할 수 있다 (합산이 두 번 찍힌 경우)."""
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:44,058 INFO 합산: {'BTC': '33.3'}\n"
+        "2026-08-31 00:05:44,059 INFO 합산: {'BTC': '33.3%'}\n"
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert sorted(r.coins()) == ['BTC']
+    assert r.target_rank == cdr.FUT_TGT_COMBINED
+
+
+def test_r2_1_lower_rank_failure_after_good_higher_rank_keeps_it(tmp_path):
+    """이미 상위 권위 값을 받은 뒤 하위 권위 줄이 깨져도 상위 값은 유지된다."""
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:44,120 INFO   🔁 V24 refill v2 적용: {'BTC': '33.3%', 'SOL': '33.3%'}"
+        " | top diffs=[]\n"
+        '2026-08-31 00:05:44,121 INFO DRY-RUN REBALANCE: {"BTC": "33.3%"}\n'
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert sorted(r.coins()) == ['BTC', 'SOL']
+    assert r.target_rank == cdr.FUT_TGT_REFILL
+    assert r.result_kind == 'warn'
+
+
+# ── R2-2: 전략별 타겟은 cash 추가 후 재검증 ──
+def test_r2_2_member_cash_makes_sum_over_100(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:44,058 INFO   D_SMA42 → {'BTC': '80.0%'} (cash=80%)\n"
+        "2026-08-31 00:05:44,059 INFO 합산: {'BTC': '80.0%'}\n"
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.members == {}                                  # 전략 타겟은 버린다
+    assert any('타겟 파싱 실패' in p for p in r.problems)
+    assert 'D_SMA42 → {\'BTC\': \'80.0%\'} (cash=80%)' in '\n'.join(r.problems)
+    assert r.result_kind == 'warn'
+    assert r.canary_str() == '알 수 없음'                    # 추론 금지
+    assert cdr._parse_fut_weights("{'BTC': '80.0%'}", '80') is None
+
+
+def test_r2_2_empty_dict_with_non_100_cash(tmp_path):
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:44,058 INFO   D_SMA42 → {} (cash=20%)\n"
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.members == {}                                  # 조용한 Cash=100% 금지
+    assert any('cash=20%' in p for p in r.problems)
+    assert r.result_kind == 'warn'
+    assert cdr._parse_fut_weights('{}', '20') is None
+    assert cdr._parse_fut_weights('CASH 100%', '20') is None
+    # 실물 정상 케이스는 그대로 통과해야 한다
+    assert cdr._parse_fut_weights('CASH 100%', '100') == {'Cash': 1.0}
+    assert cdr._parse_fut_weights("{'BTC': '33.3%', 'ETH': '33.3%'}", '33')['Cash'] == 0.33
+
+
+# ── R2-3: 시작/완료 마커 전체행 앵커 ──
+def test_r2_3_quoted_markers_in_normal_log_line(tmp_path):
+    """일반 로그 첫 줄이 마커 문구를 인용해도 블록 경계/완주 판정이 흔들리면 안 된다."""
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,000 WARNING 이전 실행 인용: '=== 바이낸스 선물 매매 시작"
+        " (run_id=OLD) ===' 재확인 필요\n"
+        "2026-08-31 00:05:33,500 INFO 참고: 지난 실행은 '=== 완료 (9.9s) ===' 로 끝났다\n"
+        "2026-08-31 00:05:34,000 INFO DRY-RUN REBALANCE: CASH\n"
+        "2026-08-31 00:05:34,100 INFO === 완료 (2.0s) ===\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.start_count == 1                 # 인용된 시작 문구는 세지 않는다
+    assert r.run_id == 'R1'
+    assert r.run_time == '00:05:32'
+    assert r.outside_note == ''               # 인용된 완료로 블록이 잘리지 않는다
+    assert r.coins() == {}                    # 블록 끝까지 읽어 DRY-RUN 줄을 봤다
+    assert r.dry_run is True
+    # 인용 완료 줄은 '정상 완료' 판정 근거가 아니다 — 진짜 완료 행이 근거
+    assert r.result_kind == 'warn'            # WARNING 승격 (마커 미분류)
+    assert len(r.issues) == 1
+
+
+def test_r2_3_incomplete_block_not_closed_by_quoted_done(tmp_path):
+    """완료 문구가 인용만 됐고 진짜 완료 행이 없으면 미완료(unknown)로 남는다."""
+    log = (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:33,500 INFO 참고: '=== 완료 (9.9s) ===' 형식으로 끝난다\n"
+    )
+    r = _fut(tmp_path, log)
+    assert r.ran is True
+    assert r.result_kind == 'unknown'
+    assert '결과 마커 없음' in r.result_label
+    assert r.outside_note == ''
+
+
+def test_r2_3_real_marker_rows_still_match():
+    assert cdr.RE_FUT_START.match('=== 바이낸스 선물 매매 시작 (run_id=20260831_090532) ===')
+    assert cdr.RE_FUT_START.match('=== 바이낸스 선물 매매 시작 ===')
+    assert cdr.RE_FUT_DONE.match('=== 완료 (12.0s) ===')
+    assert cdr.RE_FUT_DONE.match('=== 완료 ===')
+    assert not cdr.RE_FUT_DONE.match("인용: '=== 완료 (12.0s) ==='")
+    assert not cdr.RE_FUT_START.match('앞말 === 바이낸스 선물 매매 시작 (run_id=X) ===')
+
+
+# ─── pytest 없는 환경(오라클 .venv)용 최소 러너 — pytest 스타일은 그대로 ───
+if __name__ == '__main__':  # pragma: no cover
+    import tempfile
+    import traceback
+
+    fails = 0
+    for _name, _fn in sorted(globals().items()):
+        if not (_name.startswith('test_') and callable(_fn)):
+            continue
+        with tempfile.TemporaryDirectory() as _tmp:
+            try:
+                _fn(_tmp) if _fn.__code__.co_argcount else _fn()
+                print(f'  PASS  {_name}')
+            except Exception:
+                fails += 1
+                print(f'  FAIL  {_name}')
+                traceback.print_exc()
+    print('ALL PASS' if not fails else f'{fails} FAILED')
+    sys.exit(1 if fails else 0)
