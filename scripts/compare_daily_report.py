@@ -16,6 +16,25 @@
   선물: YYYY-MM-DD HH:MM:SS,mmm LEVEL <message>   (python logging 기본 포맷)
   (message 가 여러 줄이면 후속 줄엔 타임스탬프 없음 → 직전 레코드에 이어붙임)
 
+리포트 형태:
+  📊 일일 운용 리포트 2026-08-31 (KST 기준)
+
+  [업비트] 09:05:58 (dry) ✅ 거래 완료
+    타겟: BTC 33.3%, ETH 33.3%, SOL 33.3% (cash=0.0%)
+
+  [바낸현물] 09:05:38 (dry) cycle=09055998 ✅ 거래 완료
+    타겟: BTC 33.3%, ETH 33.3%, SOL 33.3% (cash=0.0%)
+
+  [선물] 09:05:32 (dry) run=20260831_090532 ✅ 정상 완료
+    타겟: BTC 33.3% (L2), ETH 33.3% (L2), cash 33.4% (refill v2 반영)
+    PV: $0.00
+
+  ── 현물 비교 ──
+  ✅ 실행 쌍 정합 / ✅ 실행 모드 일치 / ✅ 카나리 일치 / ✅ 코인 집합 일치 / ✅ 비중 일치
+
+  블록의 '카나리:' 줄은 평상시(전 멤버 ON·양쪽 일치)엔 생략하고, OFF·판별 불가·불일치·
+  한쪽 미실행일 때만 싣는다. 비교 섹션의 카나리 판정 줄은 항상 나온다.
+
 날짜 기준:
   서비스 날짜는 KST(Asia/Seoul) 기준 '오늘'. 로그 타임스탬프는 서버 로컬시각(UTC)이므로
   KST 09:05 실행분은 같은 날짜의 UTC 00:05 로 기록된다 (KST 09시 이후 실행에 한해 날짜 일치).
@@ -728,6 +747,14 @@ class FutResult:
         body = ', '.join(f'{m}={s}' for m, s in sorted(self.canary.items()))
         return f'{body} ({self.canary_source})' if self.canary_source else body
 
+    def canary_visible(self) -> bool:
+        """평상시(전 멤버 ON)엔 숨기고 OFF/판별 불가만 알린다.
+
+        '타겟 추론' 으로 나온 ON 도 매일 뜨는 평상 상태라 숨긴다.
+        타겟 파싱 실패로 추론을 못 한 날은 canary 가 비어 '알 수 없음' 이라 표시된다.
+        """
+        return (not self.canary) or any(v != 'ON' for v in self.canary.values())
+
     def target_str(self) -> str:
         c = self.coins()
         cash = self.combined.get('Cash', 0.0)
@@ -935,6 +962,24 @@ def _service_today() -> str:
 
 
 # ─── 리포트 ───
+def _spot_canary_visible(sides: List[SideResult]) -> bool:
+    """현물 블록에 카나리 줄을 실을지.
+
+    평상시(양쪽 실행 + 전 멤버 ON + 일치)엔 매일 같은 줄이라 노이즈다 → 숨긴다.
+    OFF 가 하나라도 있거나, 판별 불가거나, 불일치거나, 한쪽이 미실행이면
+    판단 근거가 필요하므로 양쪽 다 보여준다 (fail-loud).
+    """
+    a, b = sides[0], sides[1]
+    if not (a.ran and b.ran and a.canary and b.canary):
+        return True
+    if any(v != 'ON' for s in sides for v in s.canary.values()):
+        return True
+    # 전 멤버 ON 이면 아래는 항상 '일치' 지만, 판정 규칙을 그대로 남겨 둔다
+    if set(a.canary) == set(b.canary):
+        return any(a.canary[k] != b.canary[k] for k in a.canary)
+    return a.canary_overall() != b.canary_overall()
+
+
 def _fut_lines(fut: 'FutResult') -> Tuple[List[str], bool]:
     """선물 블록 (본문 줄들, 경고여부). 현물과 달리 비교 없이 결과만 싣는다."""
     if not fut.ran:
@@ -950,7 +995,8 @@ def _fut_lines(fut: 'FutResult') -> Tuple[List[str], bool]:
     multi = f' [{fut.start_count}회 실행, 마지막 사용]' if fut.start_count > 1 else ''
     rid = f' run={fut.run_id}' if fut.run_id else ''
     lines = [f'\n[{fut.name}] {fut.run_time} ({fut.mode_str()}){rid} {icon} {fut.result_label}{multi}']
-    lines.append(f'  카나리: {fut.canary_str()}')
+    if fut.canary_visible():   # 평상시(전 멤버 ON)엔 생략 — OFF/판별 불가만 알린다
+        lines.append(f'  카나리: {fut.canary_str()}')
     lines.append(f'  타겟: {fut.target_str()}{fut.target_src_str()}')
     if len(fut.members) > 1:   # 앙상블일 때만 (단일 전략이면 합산과 같아 중복)
         lines.append(f'  전략별: {fut.members_str()}')
@@ -975,10 +1021,15 @@ def build_report(day: str, sides: List[SideResult],
 
     sides = 현물 2축(업비트/바낸현물) — 서로 1:1 비교한다.
     fut   = 선물(V25) — 전략·자산이 달라 비교하지 않고 결과만 싣는다 (None 이면 생략).
+
+    블록의 '카나리' 줄은 이상할 때만 싣는다(_spot_canary_visible / FutResult.canary_visible).
+    '── 현물 비교 ──' 의 카나리 일치/불일치 판정은 그대로 항상 나온다.
     """
     a, b = sides[0], sides[1]
     warn = False
     lines = [f'📊 일일 운용 리포트 {day} (KST 기준)']
+    # 상대편 상태를 알아야 정해지므로 블록 렌더링 전에 한 번만 계산한다
+    show_canary = _spot_canary_visible(sides)
 
     # LIVE 혼입 경고 — 비교 검증 기간엔 양쪽 모두 dry-run 이어야 한다 (M8)
     live_sides = [s.name for s in sides if s.ran and s.dry_run is False]
@@ -1005,7 +1056,8 @@ def build_report(day: str, sides: List[SideResult],
             warn = True
         cyc = f' cycle={s.cycle_id}' if s.cycle_id else ''
         lines.append(f'\n[{s.name}] {s.run_time} ({mode}){cyc} {icon} {s.result_label}{multi}')
-        lines.append(f'  카나리: {s.canary_str()}')
+        if show_canary:
+            lines.append(f'  카나리: {s.canary_str()}')
         lines.append(f'  타겟: {s.target_str()}')
         if s.issues:
             lines.append(f'  이슈: {", ".join(s.issues)}')

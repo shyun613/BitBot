@@ -315,15 +315,24 @@ def test_fut_partial_record_without_start(tmp_path):
 
 # ──────────────────── (f) build_report 통합 ────────────────────
 SPOT_LOG = """[{day} 00:05:10] [{rid}] Executor 시작 (dry_run=True)
-[{day} 00:05:11] [{rid}] combined target: BTC:33.3%, ETH:33.3% (cash=33.4%)
+{canary}[{day} 00:05:11] [{rid}] combined target: {tgt} (cash={cash}%)
 [{day} 00:05:20] [{rid}] 거래 완료
 """
+SPOT_SIDES = (('업비트', 'executor_coin.log'), ('바낸현물', 'executor_coin_binance.log'))
 
 
-def _spot_sides(tmp_path):
+def _spot_canary(state):
+    """'D_SMA42 카나리 ON|OFF' 한 줄 (SideResult 가 명시 상태로 읽는다)."""
+    return f'[{DAY} 00:05:10] [0005abcd] D_SMA42 카나리 {state}\n' if state else ''
+
+
+def _spot_sides(tmp_path, canary_a=None, canary_b=None,
+                tgt='BTC:33.3%, ETH:33.3%', cash='33.4'):
     sides = []
-    for name, fname in (('업비트', 'executor_coin.log'), ('바낸현물', 'executor_coin_binance.log')):
-        path = _write(tmp_path, SPOT_LOG.format(day=DAY, rid='0005abcd'), fname)
+    for (name, fname), state in zip(SPOT_SIDES, (canary_a, canary_b)):
+        body = SPOT_LOG.format(day=DAY, rid='0005abcd', canary=_spot_canary(state),
+                               tgt=tgt, cash=cash)
+        path = _write(tmp_path, body, fname)
         s = cdr.SideResult(name, path)
         s.parse(DAY)
         sides.append(s)
@@ -872,6 +881,109 @@ def test_r2_3_real_marker_rows_still_match():
     assert cdr.RE_FUT_DONE.match('=== 완료 ===')
     assert not cdr.RE_FUT_DONE.match("인용: '=== 완료 (12.0s) ==='")
     assert not cdr.RE_FUT_START.match('앞말 === 바이낸스 선물 매매 시작 (run_id=X) ===')
+
+
+# ═══════════ 카나리 줄 조건부 표시 (평상시 숨김, 이상 시 표시) ═══════════
+def test_canary_line_hidden_when_all_on_and_matching(tmp_path):
+    """양쪽 실행 + 전 멤버 ON + 일치 → 블록에선 숨기고, 비교 판정은 그대로 낸다."""
+    sides = _spot_sides(tmp_path)                       # 타겟 추론 → 양쪽 ON
+    fut = _fut(tmp_path, SAMPLE_BLOCK)                  # 타겟 추론 → ON
+    body, warn = cdr.build_report(DAY, sides, fut)
+
+    assert '  카나리:' not in body                       # 세 블록 모두 생략
+    assert '✅ 카나리 일치' in body                       # 비교 로직은 그대로
+    assert cdr._spot_canary_visible(sides) is False
+    assert fut.canary_visible() is False
+    assert warn is False
+    # 숨겨도 판정 근거 자체는 남아 있다
+    assert sides[0].canary == {'combined': 'ON'} and fut.canary == {'D_SMA42': 'ON'}
+
+
+def test_canary_line_shown_when_off(tmp_path):
+    """OFF 인 날은 양쪽 블록에 표시 (일치해도 평상 상태가 아니다)."""
+    sides = _spot_sides(tmp_path, canary_a='OFF', canary_b='OFF')
+    body, _warn = cdr.build_report(DAY, sides)
+
+    assert body.count('  카나리: D_SMA42=OFF') == 2
+    assert '✅ 카나리 일치' in body
+    assert cdr._spot_canary_visible(sides) is True
+
+
+def test_canary_line_shown_when_sides_disagree(tmp_path):
+    """불일치면 양쪽 블록 모두 표시 — 어느 쪽이 어떤 상태였는지 봐야 한다."""
+    sides = _spot_sides(tmp_path, canary_a='ON', canary_b='OFF')
+    body, warn = cdr.build_report(DAY, sides)
+
+    assert '[업비트]' in body and '  카나리: D_SMA42=ON' in body
+    assert '  카나리: D_SMA42=OFF' in body
+    assert body.count('  카나리:') == 2
+    assert '⚠️ 카나리 불일치' in body
+    assert warn is True
+    assert cdr._spot_canary_visible(sides) is True
+
+
+def test_canary_line_shown_when_undeterminable(tmp_path):
+    """한쪽이 판별 불가('알 수 없음')면 양쪽 표시."""
+    skip_log = (f'[{DAY} 00:05:10] [0005abcd] Executor 시작 (dry_run=True)\n'
+                f'[{DAY} 00:05:12] [0005abcd] 새 봉 없음\n')
+    sides = _spot_sides(tmp_path)
+    path = _write(tmp_path, skip_log, 'executor_coin_binance.log')
+    b = cdr.SideResult('바낸현물', path)
+    b.parse(DAY)
+    sides[1] = b
+    assert b.canary == {}
+
+    body, warn = cdr.build_report(DAY, sides)
+    assert body.count('  카나리:') == 2
+    assert '  카나리: 알 수 없음' in body
+    assert '⚠️ 카나리: 한쪽 이상 판별 불가' in body
+    assert warn is True
+
+
+def test_canary_line_shown_when_one_side_missing(tmp_path):
+    """한쪽 미실행이면 실행된 쪽은 근거를 보여준다 (비교가 불가하므로)."""
+    sides = _spot_sides(tmp_path)
+    missing = cdr.SideResult('바낸현물', os.path.join(str(tmp_path), 'nope.log'))
+    missing.parse(DAY)
+    sides[1] = missing
+
+    body, warn = cdr.build_report(DAY, sides)
+    assert body.count('  카나리:') == 1               # 미실행 블록엔 애초에 줄이 없다
+    assert '[바낸현물] ⚠️ 미실행' in body
+    assert warn is True
+    assert cdr._spot_canary_visible(sides) is True
+
+
+def test_fut_canary_line_shown_when_off_or_unknown(tmp_path):
+    off = _fut(tmp_path, (
+        "2026-08-31 00:05:31,048 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        "2026-08-31 00:05:31,207 INFO   D_SMA42 BTC=$77,377 SMA(42)=$78,016"
+        " ratio=0.9918 canary=OFF\n"
+        "2026-08-31 00:05:31,208 INFO 합산: CASH 100%\n"
+        "2026-08-31 00:05:31,208 INFO DRY-RUN REBALANCE: CASH\n"
+        "2026-08-31 00:05:32,283 INFO === 완료 (22.9s) ===\n"
+    ))
+    assert off.canary_visible() is True
+    assert '  카나리: D_SMA42=OFF (canary 로그)' in '\n'.join(cdr._fut_lines(off)[0])
+
+    # 타겟 파싱 실패로 추론을 못 한 날 → '알 수 없음' 을 보여준다
+    broken = _fut(tmp_path, (
+        "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+        '2026-08-31 00:05:44,058 INFO 합산: {"BTC": "33.3%"}\n'
+        "2026-08-31 00:05:44,143 INFO === 완료 (12.0s) ===\n"
+    ))
+    assert broken.canary == {} and broken.canary_visible() is True
+    assert '  카나리: 알 수 없음' in '\n'.join(cdr._fut_lines(broken)[0])
+
+
+def test_fut_canary_line_hidden_when_all_on(tmp_path):
+    """'타겟 추론' ON 도 매일 뜨는 평상 상태라 숨긴다."""
+    r = _fut(tmp_path, SAMPLE_BLOCK)
+    assert r.canary == {'D_SMA42': 'ON'} and r.canary_source == '타겟 추론'
+    assert r.canary_visible() is False
+    body = '\n'.join(cdr._fut_lines(r)[0])
+    assert '  카나리:' not in body
+    assert '  타겟: BTC 33.3% (L2)' in body            # 나머지 줄은 그대로
 
 
 # ─── pytest 없는 환경(오라클 .venv)용 최소 러너 — pytest 스타일은 그대로 ───
