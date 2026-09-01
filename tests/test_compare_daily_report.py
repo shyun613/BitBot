@@ -314,7 +314,7 @@ def test_fut_partial_record_without_start(tmp_path):
 
 
 # ──────────────────── (f) build_report 통합 ────────────────────
-SPOT_LOG = """[{day} 00:05:10] [{rid}] Executor 시작 (dry_run=True)
+SPOT_LOG = """[{day} 00:05:10] [{rid}] Executor 시작 (dry_run={dry})
 {canary}[{day} 00:05:11] [{rid}] combined target: {tgt} (cash={cash}%)
 [{day} 00:05:20] [{rid}] 거래 완료
 """
@@ -327,11 +327,12 @@ def _spot_canary(state):
 
 
 def _spot_sides(tmp_path, canary_a=None, canary_b=None,
-                tgt='BTC:33.3%, ETH:33.3%', cash='33.4'):
+                tgt='BTC:33.3%, ETH:33.3%', cash='33.4', dry=(True, True)):
+    """dry=(업비트, 바낸현물) — False 면 'Executor 시작 (dry_run=False)' = LIVE 로 파싱된다."""
     sides = []
-    for (name, fname), state in zip(SPOT_SIDES, (canary_a, canary_b)):
+    for (name, fname), state, dry_run in zip(SPOT_SIDES, (canary_a, canary_b), dry):
         body = SPOT_LOG.format(day=DAY, rid='0005abcd', canary=_spot_canary(state),
-                               tgt=tgt, cash=cash)
+                               tgt=tgt, cash=cash, dry=dry_run)
         path = _write(tmp_path, body, fname)
         s = cdr.SideResult(name, path)
         s.parse(DAY)
@@ -984,6 +985,78 @@ def test_fut_canary_line_hidden_when_all_on(tmp_path):
     body = '\n'.join(cdr._fut_lines(r)[0])
     assert '  카나리:' not in body
     assert '  타겟: BTC 33.3% (L2)' in body            # 나머지 줄은 그대로
+
+
+# ══════ 실행 모드(dry/LIVE)는 정합 판정 대상이 아니다 (2026-09-01 결정) ══════
+def _mode_lines(body):
+    return [ln for ln in body.split('\n') if ln.startswith('실행 모드')]
+
+
+def test_mode_upbit_live_vs_binance_dry_is_not_a_warning(tmp_path):
+    """운영 조합(업비트 LIVE + 바낸현물 dry) — 경고 없이 정보 줄만, 정합 판정은 그대로."""
+    sides = _spot_sides(tmp_path, dry=(False, True))
+    assert sides[0].dry_run is False and sides[1].dry_run is True
+    body, warn = cdr.build_report(DAY, sides)
+
+    assert 'LIVE 혼입' not in body                     # 옛 경고는 사라졌다
+    assert _mode_lines(body) == ['실행 모드: 업비트=LIVE, 바낸현물=dry-run']
+    assert '⚠️' not in body                            # 모드 차이로 어떤 경고도 뜨지 않는다
+    assert not body.startswith('⚠️')                   # 옛 코드가 맨 앞에 끼워 넣던 줄
+    assert warn is False
+    # 실제 비교 대상(전략 산출물)은 그대로 판정된다
+    assert '✅ 실행 쌍 정합' in body
+    assert '✅ 카나리 일치' in body
+    assert '✅ 코인 집합 일치' in body
+    assert '✅ 비중 일치' in body
+    assert '[업비트] 00:05:10 (LIVE)' in body          # 블록엔 모드가 계속 보인다
+
+
+def test_mode_both_dry_is_a_single_neutral_line(tmp_path):
+    """양쪽 같은 모드여도 ✅ 판정을 주지 않는다 — 중립 한 줄."""
+    sides = _spot_sides(tmp_path)
+    body, warn = cdr.build_report(DAY, sides)
+
+    assert _mode_lines(body) == ['실행 모드: 양쪽 dry-run']
+    assert '✅ 실행 모드 일치' not in body
+    assert warn is False
+
+
+def test_mode_upbit_dry_vs_binance_live_is_not_a_warning(tmp_path):
+    """역조합(업비트 dry + 바낸현물 LIVE)도 방향과 무관하게 정보 줄 하나뿐이다."""
+    sides = _spot_sides(tmp_path, dry=(True, False))
+    assert sides[0].dry_run is True and sides[1].dry_run is False
+    body, warn = cdr.build_report(DAY, sides)
+
+    assert _mode_lines(body) == ['실행 모드: 업비트=dry-run, 바낸현물=LIVE']
+    assert '⚠️' not in body
+    assert warn is False
+
+
+def test_mode_both_live_is_a_single_neutral_line(tmp_path):
+    """양쪽 LIVE 여도 판정하지 않는다 — 'LIVE 혼입' 경고는 완전히 사라졌다."""
+    sides = _spot_sides(tmp_path, dry=(False, False))
+    body, warn = cdr.build_report(DAY, sides)
+
+    assert _mode_lines(body) == ['실행 모드: 양쪽 LIVE']
+    assert 'LIVE 혼입' not in body
+    assert warn is False
+
+
+def test_mode_unknown_side_shows_question_mark_without_warning(tmp_path):
+    """모드 불명(None)은 '?' 로만 표시 — 이 줄 때문에 warn 이 서지 않는다.
+
+    SideResult 는 RE_START 로 블록을 잡으므로 ran=True 면서 dry_run=None 이 나올 수 없다.
+    파싱 품질 경고(FutResult 의 '실행 모드 불명')는 result_label 경로가 따로 담당하므로,
+    여기서는 비교 섹션의 표시 분기만 직접 값을 넣어 확인한다.
+    """
+    sides = _spot_sides(tmp_path)
+    sides[1].dry_run = None
+    body, warn = cdr.build_report(DAY, sides)
+
+    assert _mode_lines(body) == ['실행 모드: 업비트=dry-run, 바낸현물=?']
+    assert '⚠️' not in body
+    assert warn is False
+    assert cdr._mode_word(sides[0]) == 'dry-run' and cdr._mode_word(sides[1]) == '?'
 
 
 # ─── pytest 없는 환경(오라클 .venv)용 최소 러너 — pytest 스타일은 그대로 ───

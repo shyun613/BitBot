@@ -19,7 +19,7 @@
 리포트 형태:
   📊 일일 운용 리포트 2026-08-31 (KST 기준)
 
-  [업비트] 09:05:58 (dry) ✅ 거래 완료
+  [업비트] 09:05:58 (LIVE) ✅ 거래 완료
     타겟: BTC 33.3%, ETH 33.3%, SOL 33.3% (cash=0.0%)
 
   [바낸현물] 09:05:38 (dry) cycle=09055998 ✅ 거래 완료
@@ -30,7 +30,11 @@
     PV: $0.00
 
   ── 현물 비교 ──
-  ✅ 실행 쌍 정합 / ✅ 실행 모드 일치 / ✅ 카나리 일치 / ✅ 코인 집합 일치 / ✅ 비중 일치
+  ✅ 실행 쌍 정합 / ✅ 카나리 일치 / ✅ 코인 집합 일치 / ✅ 비중 일치
+  실행 모드: 업비트=LIVE, 바낸현물=dry-run
+
+  실행 모드(dry/LIVE)는 정합 판정 대상이 아니다 — 비교 대상은 전략 산출물(타겟·카나리)이고,
+  운영 조합이 '업비트 LIVE + 바낸현물 dry-run' 인 게 정상 상태라 정보로만 표시한다.
 
   블록의 '카나리:' 줄은 평상시(전 멤버 ON·양쪽 일치)엔 생략하고, OFF·판별 불가·불일치·
   한쪽 미실행일 때만 싣는다. 비교 섹션의 카나리 판정 줄은 항상 나온다.
@@ -980,6 +984,11 @@ def _spot_canary_visible(sides: List[SideResult]) -> bool:
     return a.canary_overall() != b.canary_overall()
 
 
+def _mode_word(s: SideResult) -> str:
+    """비교 섹션의 실행 모드 표기 — 판정이 아니라 정보 표시용."""
+    return '?' if s.dry_run is None else ('dry-run' if s.dry_run else 'LIVE')
+
+
 def _fut_lines(fut: 'FutResult') -> Tuple[List[str], bool]:
     """선물 블록 (본문 줄들, 경고여부). 현물과 달리 비교 없이 결과만 싣는다."""
     if not fut.ran:
@@ -1031,11 +1040,9 @@ def build_report(day: str, sides: List[SideResult],
     # 상대편 상태를 알아야 정해지므로 블록 렌더링 전에 한 번만 계산한다
     show_canary = _spot_canary_visible(sides)
 
-    # LIVE 혼입 경고 — 비교 검증 기간엔 양쪽 모두 dry-run 이어야 한다 (M8)
-    live_sides = [s.name for s in sides if s.ran and s.dry_run is False]
-    if live_sides:
-        lines.insert(0, f'⚠️ LIVE 혼입 ({", ".join(live_sides)}) — 실거래 실행분이라 1:1 비교 무효')
-        warn = True
+    # 실행 모드(dry/LIVE)는 정합 판정 대상이 아니라 경고하지 않는다. 비교 대상은 전략
+    # 산출물(타겟·카나리)이고, '업비트 LIVE + 바낸현물 dry-run' 이 정상 운영 조합이다
+    # (2026-09-01 사용자 결정). 모드는 블록/비교 섹션에 정보로만 싣는다.
 
     for s in sides:
         mode = '?' if s.dry_run is None else ('dry' if s.dry_run else 'LIVE')
@@ -1103,12 +1110,11 @@ def build_report(day: str, sides: List[SideResult],
                          + f' (시작 시각 차 {gap/60:.0f}분)')
             warn = True
 
-    # 0-2) dry-run 모드 동일성 (M8)
+    # 0-2) 실행 모드 — 정합 판정 아님, 정보 표시만 (모드 불명 warn 은 파싱 단계 M1 이 담당)
     if a.dry_run == b.dry_run and a.dry_run is not None:
-        lines.append(f'✅ 실행 모드 일치 ({"dry-run" if a.dry_run else "LIVE"})')
+        lines.append(f'실행 모드: 양쪽 {_mode_word(a)}')
     else:
-        lines.append(f'⚠️ 실행 모드 불일치 — {a.name}={a.dry_run}, {b.name}={b.dry_run}')
-        warn = True
+        lines.append(f'실행 모드: {a.name}={_mode_word(a)}, {b.name}={_mode_word(b)}')
 
     # 1) 카나리 — 멤버 키가 같으면 멤버별, 다르면 (추론 경로 차이) 종합 ON/OFF 로 비교
     if not a.canary or not b.canary:
