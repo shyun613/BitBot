@@ -8,6 +8,7 @@
       파싱/리포트 빌드 함수만 직접 호출하고, common.notify 는 스텁으로 갈아끼운다.
 """
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -1057,6 +1058,436 @@ def test_mode_unknown_side_shows_question_mark_without_warning(tmp_path):
     assert '⚠️' not in body
     assert warn is False
     assert cdr._mode_word(sides[0]) == 'dry-run' and cdr._mode_word(sides[1]) == '?'
+
+
+# ══════ 업비트 실계좌 평가액 + 원금 대비 등락률 (네트워크 전면 mock) ══════
+def _swap(**kw):
+    """cdr 모듈 속성 임시 교체 — pytest monkeypatch 없이도 도는 fallback 러너 대비."""
+    old = {k: getattr(cdr, k) for k in kw}
+    for k, v in kw.items():
+        setattr(cdr, k, v)
+    return old
+
+
+def _restore(old):
+    for k, v in old.items():
+        setattr(cdr, k, v)
+
+
+def _fake_http(accounts=None, ticker=None, deposits=None, calls=None):
+    """(_upbit_get, _upbit_public_get) 대역 — 네트워크 없이 (status, json) 을 돌려준다.
+
+    accounts/ticker/deposits 에 (status, body) 튜플이나 Exception 을 넣는다.
+    호출 인자는 calls 리스트에 (path, params) 로 쌓여 배치 조회 여부까지 검증한다.
+    """
+    routes = {'/v1/accounts': accounts, '/v1/ticker': ticker, '/v1/deposits': deposits}
+
+    def _serve(path, params):
+        if calls is not None:
+            calls.append((path, dict(params)))
+        got = routes.get(path)
+        if isinstance(got, Exception):
+            raise got
+        if got is None:
+            raise AssertionError(f'예상 못한 호출: {path}')
+        return got
+
+    return _serve, _serve
+
+
+NOW = '2026-09-01T09:20:00+09:00'
+
+
+def _principal_file(tmp_path, principal=2000000.0, last='2026-08-30T00:00:00+09:00',
+                    processed=None):
+    path = os.path.join(str(tmp_path), 'report_principal.json')
+    state = {'principal_krw': principal, 'last_deposit_check': last}
+    if processed is not None:
+        state['processed_uuids'] = processed
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(state, f)
+    return path
+
+
+def _deposit(uuid, done_at, amount, state='ACCEPTED', currency='KRW'):
+    return {'uuid': uuid, 'currency': currency, 'state': state,
+            'amount': str(amount), 'done_at': done_at}
+
+
+def _read_json(path):
+    with open(path, encoding='utf-8') as f:
+        return json.load(f)
+
+
+# ── 렌더링 ──
+def test_upbit_value_line_rendered_in_upbit_block_only(tmp_path):
+    """정상 케이스: 천단위 콤마 + 부호 + 소수 1자리, warn 없음. 업비트 블록에만 붙는다."""
+    sides = _spot_sides(tmp_path, dry=(False, True))
+    fut = _fut(tmp_path, SAMPLE_BLOCK)
+    body, warn = cdr.build_report(DAY, sides, fut,
+                                  {'value': 2100000.0, 'pct': 5.0, 'note': ''})
+
+    assert '  평가액: 2,100,000원 (+5.0%)' in body
+    assert body.count('평가액:') == 1                  # 바낸현물·선물 블록엔 없다
+    upbit_block = body.split('[바낸현물]')[0]
+    assert '평가액: 2,100,000원 (+5.0%)' in upbit_block
+    assert warn is False
+
+
+def test_upbit_value_line_negative_pct(tmp_path):
+    """손실이면 부호가 그대로 -, 역시 warn 아님 (평가액은 판정 대상이 아니다)."""
+    sides = _spot_sides(tmp_path)
+    body, warn = cdr.build_report(DAY, sides, None,
+                                  {'value': 1899000.0, 'pct': -5.14, 'note': ''})
+
+    assert '  평가액: 1,899,000원 (-5.1%)' in body
+    assert warn is False
+
+
+def test_upbit_value_without_principal_warns(tmp_path):
+    """평가액은 있는데 원금을 못 읽으면 등락률을 지어내지 않고 사유를 싣는다 (warn)."""
+    sides = _spot_sides(tmp_path)
+    body, warn = cdr.build_report(DAY, sides, None,
+                                  {'value': 1000000.0, 'pct': None,
+                                   'note': '원금 파일 없음(report_principal.json)'})
+
+    assert '  평가액: 1,000,000원 (원금 미설정 — 원금 파일 없음(report_principal.json))' in body
+    assert warn is True
+
+
+def test_upbit_value_fetch_failure_warns(tmp_path):
+    """조회 자체가 실패하면 숫자 없이 사유만 (warn)."""
+    sides = _spot_sides(tmp_path)
+    body, warn = cdr.build_report(DAY, sides, None,
+                                  {'value': None, 'pct': None, 'note': '업비트 키 미설정'})
+
+    assert '  평가액: 조회 실패 — 업비트 키 미설정' in body
+    assert warn is True
+
+
+def test_upbit_value_partial_price_failure_warns(tmp_path):
+    """가격 누락 심볼이 있으면 평가액이 과소일 수 있으니 메모를 붙이고 warn (fail-loud)."""
+    sides = _spot_sides(tmp_path)
+    body, warn = cdr.build_report(DAY, sides, None,
+                                  {'value': 500000.0, 'pct': 1.0,
+                                   'note': '가격 조회 실패: XRP'})
+
+    assert '  평가액: 500,000원 (+1.0%) — 가격 조회 실패: XRP' in body
+    assert warn is True
+
+
+def test_upbit_value_absent_keeps_report_identical(tmp_path):
+    """미주입(None)이면 줄 자체가 없고 기존 출력과 완전히 동일하다."""
+    sides = _spot_sides(tmp_path)
+    fut = _fut(tmp_path, SAMPLE_BLOCK)
+    base, base_warn = cdr.build_report(DAY, sides, fut)
+    same, same_warn = cdr.build_report(DAY, sides, fut, None)
+
+    assert '평가액' not in base
+    assert same == base and same_warn == base_warn is False
+
+
+# ── 평가액 조회 (pyupbit 없이 REST 직접 — timeout 이 걸린 경로) ──
+def test_upbit_account_value_sums_krw_and_coins(tmp_path):
+    """KRW 는 그대로, 코인은 (balance+locked)×현재가. 가격 없는 심볼은 0 + 메모."""
+    calls = []
+    priv, pub = _fake_http(
+        accounts=(200, [
+            {'currency': 'KRW', 'balance': '100000.0', 'locked': '0.0'},
+            {'currency': 'BTC', 'balance': '0.01', 'locked': '0.005'},
+            {'currency': 'XRP', 'balance': '100.0', 'locked': '0.0'},   # ticker 응답에 없음
+            {'currency': 'DOGE', 'balance': '0.0', 'locked': '0.0'},    # 잔고 0 → 무시
+        ]),
+        ticker=(200, [{'market': 'KRW-BTC', 'trade_price': 100000000.0}]),
+        calls=calls,
+    )
+    old = _swap(UPBIT_ACCESS_KEY='ak', UPBIT_SECRET_KEY='sk',
+                _upbit_get=priv, _upbit_public_get=pub)
+    try:
+        value, err = cdr._upbit_account_value()
+    finally:
+        _restore(old)
+
+    assert _approx(value, 100000.0 + 0.015 * 100000000.0)   # 1,600,000
+    assert err == '가격 조회 실패: XRP'
+    # 현재가는 심볼마다가 아니라 배치 1회 (레이트리밋)
+    assert calls == [('/v1/accounts', {}),
+                     ('/v1/ticker', {'markets': 'KRW-BTC,KRW-XRP'})]
+
+
+def test_upbit_account_value_without_keys(tmp_path):
+    old = _swap(UPBIT_ACCESS_KEY='', UPBIT_SECRET_KEY='')
+    try:
+        value, err = cdr._upbit_account_value()
+    finally:
+        _restore(old)
+    assert value is None and err == '업비트 키 미설정'
+
+
+def test_upbit_account_value_rejects_error_status(tmp_path):
+    """잔고 API 가 오류 상태를 주면 0원으로 착각하지 않고 조회 실패로 둔다."""
+    priv, pub = _fake_http(accounts=(401, {'error': {'message': 'invalid_access_key'}}))
+    old = _swap(UPBIT_ACCESS_KEY='ak', UPBIT_SECRET_KEY='sk',
+                _upbit_get=priv, _upbit_public_get=pub)
+    try:
+        value, err = cdr._upbit_account_value()
+    finally:
+        _restore(old)
+    assert value is None and '잔고 조회 실패 (HTTP 401)' in err
+
+
+def test_upbit_account_value_price_batch_failure_keeps_krw(tmp_path):
+    """ticker 배치가 통째로 죽어도 KRW 만이라도 돌려주고 심볼을 전부 메모에 싣는다."""
+    priv, pub = _fake_http(
+        accounts=(200, [
+            {'currency': 'KRW', 'balance': '250000.0', 'locked': '0.0'},
+            {'currency': 'BTC', 'balance': '0.01', 'locked': '0.0'},
+            {'currency': 'ETH', 'balance': '1.0', 'locked': '0.0'},
+        ]),
+        ticker=RuntimeError('timeout'),
+    )
+    old = _swap(UPBIT_ACCESS_KEY='ak', UPBIT_SECRET_KEY='sk',
+                _upbit_get=priv, _upbit_public_get=pub)
+    try:
+        value, err = cdr._upbit_account_value()
+    finally:
+        _restore(old)
+    assert _approx(value, 250000.0) and err == '가격 조회 실패: BTC, ETH'
+
+
+# ── 원금 (report_principal.json) ──
+def test_principal_adds_only_new_accepted_krw_deposits(tmp_path):
+    """last_deposit_check 이후 · ACCEPTED · KRW 입금만 가산한다."""
+    path = _principal_file(tmp_path)
+    calls = []
+    priv, _pub = _fake_http(deposits=(200, [
+        _deposit('u-new', '2026-08-31T10:00:00+09:00', 500000.0),            # 가산
+        _deposit('u-old', '2026-08-29T10:00:00+09:00', 900000.0),            # 체크시각 이전
+        _deposit('u-pend', '2026-08-31T11:00:00+09:00', 700000.0,
+                 state='PROCESSING'),                                         # 미확정
+        _deposit('u-btc', '2026-08-31T12:00:00+09:00', 1.0, currency='BTC'),  # KRW 아님
+    ]), calls=calls)
+
+    old = _swap(PRINCIPAL_FILE=path, _upbit_get=priv)
+    try:
+        principal, err = cdr._load_principal(cdr._parse_iso(NOW))
+    finally:
+        _restore(old)
+
+    assert _approx(principal, 2500000.0) and err == ''
+    assert calls == [('/v1/deposits',
+                      {'currency': 'KRW', 'limit': 100, 'order_by': 'desc'})]
+    saved = _read_json(path)
+    assert _approx(saved['principal_krw'], 2500000.0)
+    assert not os.path.exists(f'{path}.tmp.{os.getpid()}')   # 원자적 저장 흔적 없음
+
+
+def test_principal_watermark_advances_to_latest_deposit_not_now(tmp_path):
+    """워터마크는 now 가 아니라 관측한 입금의 max(done_at) 으로만 전진한다.
+
+    now 로 밀면 반영이 늦어 done_at 이 과거인 채 나중에 나타나는 입금이 유실된다.
+    """
+    path = _principal_file(tmp_path)
+    priv, _pub = _fake_http(deposits=(200, [
+        _deposit('u-a', '2026-08-31T10:00:00+09:00', 100000.0),
+        _deposit('u-b', '2026-08-31T18:30:00+09:00', 200000.0),   # 최신
+    ]))
+    old = _swap(PRINCIPAL_FILE=path, _upbit_get=priv)
+    try:
+        principal, err = cdr._load_principal(cdr._parse_iso(NOW))
+    finally:
+        _restore(old)
+
+    saved = _read_json(path)
+    assert _approx(principal, 2300000.0) and err == ''
+    assert saved['last_deposit_check'] == '2026-08-31T18:30:00+09:00'
+    assert saved['last_deposit_check'] != NOW
+    assert saved['processed_uuids'] == ['u-b']       # 워터마크 시각 건만 기록
+
+
+def test_principal_no_new_deposit_leaves_file_untouched(tmp_path):
+    """새 입금이 없으면 상태파일을 아예 건드리지 않는다 (매일 같은 내용 재기록 금지)."""
+    path = _principal_file(tmp_path, last='2026-08-31T10:00:00+09:00',
+                           processed=['u-a'])
+    before = _read_json(path)
+    mtime = os.path.getmtime(path)
+    priv, _pub = _fake_http(deposits=(200, [
+        _deposit('u-a', '2026-08-31T10:00:00+09:00', 100000.0),   # 이미 반영분
+        _deposit('u-old', '2026-08-20T10:00:00+09:00', 500000.0),
+    ]))
+    old = _swap(PRINCIPAL_FILE=path, _upbit_get=priv)
+    try:
+        principal, err = cdr._load_principal(cdr._parse_iso(NOW))
+    finally:
+        _restore(old)
+
+    assert _approx(principal, 2000000.0) and err == ''
+    assert _read_json(path) == before
+    assert os.path.getmtime(path) == mtime
+
+
+def test_principal_same_timestamp_new_uuid_is_added_once(tmp_path):
+    """워터마크와 같은 시각의 신규 입금은 가산하되, 다음 실행에서 또 더하지 않는다."""
+    path = _principal_file(tmp_path, last='2026-08-31T10:00:00+09:00',
+                           processed=['u-a'])
+    batch = (200, [
+        _deposit('u-a', '2026-08-31T10:00:00+09:00', 100000.0),   # 이미 반영
+        _deposit('u-b', '2026-08-31T10:00:00+09:00', 300000.0),   # 같은 시각 신규
+    ])
+    priv, _pub = _fake_http(deposits=batch)
+    old = _swap(PRINCIPAL_FILE=path, _upbit_get=priv)
+    try:
+        first, _e1 = cdr._load_principal(cdr._parse_iso(NOW))
+        saved = _read_json(path)
+        second, _e2 = cdr._load_principal(cdr._parse_iso(NOW))   # 같은 응답 재조회
+    finally:
+        _restore(old)
+
+    assert _approx(first, 2300000.0)
+    assert saved['last_deposit_check'] == '2026-08-31T10:00:00+09:00'
+    assert saved['processed_uuids'] == ['u-a', 'u-b']
+    assert _approx(second, 2300000.0)          # 중복 가산 없음
+
+
+def test_principal_ignores_future_dated_deposit(tmp_path):
+    """now 보다 미래인 입금은 이번엔 세지 않는다 — 워터마크를 미래로 밀면 안 된다."""
+    path = _principal_file(tmp_path)
+    priv, _pub = _fake_http(deposits=(200, [
+        _deposit('u-future', '2026-09-02T10:00:00+09:00', 400000.0),
+    ]))
+    old = _swap(PRINCIPAL_FILE=path, _upbit_get=priv)
+    try:
+        principal, err = cdr._load_principal(cdr._parse_iso(NOW))
+    finally:
+        _restore(old)
+
+    assert _approx(principal, 2000000.0) and err == ''
+    assert _read_json(path)['last_deposit_check'] == '2026-08-30T00:00:00+09:00'
+
+
+def test_principal_missing_file(tmp_path):
+    old = _swap(PRINCIPAL_FILE=os.path.join(str(tmp_path), 'nope.json'))
+    try:
+        principal, err = cdr._load_principal(cdr._parse_iso(NOW))
+    finally:
+        _restore(old)
+    assert principal is None and err == '원금 파일 없음(report_principal.json)'
+
+
+def test_principal_kept_when_deposit_api_fails(tmp_path):
+    """입금 API 실패 시 저장된 원금은 그대로 쓰고, 체크시각은 밀지 않는다."""
+    path = _principal_file(tmp_path)
+
+    def boom(p, params):
+        raise RuntimeError('timeout')
+
+    old = _swap(PRINCIPAL_FILE=path, _upbit_get=boom)
+    try:
+        principal, err = cdr._load_principal(cdr._parse_iso(NOW))
+    finally:
+        _restore(old)
+
+    assert _approx(principal, 2000000.0) and '입금동기화 실패' in err
+    saved = _read_json(path)
+    assert saved['last_deposit_check'] == '2026-08-30T00:00:00+09:00'   # 미갱신
+    assert _approx(saved['principal_krw'], 2000000.0)
+
+
+def test_principal_kept_when_deposit_api_returns_error_status(tmp_path):
+    path = _principal_file(tmp_path)
+    old = _swap(PRINCIPAL_FILE=path,
+                _upbit_get=lambda p, params: (401, {'error': 'invalid_access_key'}))
+    try:
+        principal, err = cdr._load_principal(cdr._parse_iso(NOW))
+    finally:
+        _restore(old)
+
+    assert _approx(principal, 2000000.0) and '입금동기화 실패 (HTTP 401)' in err
+    assert _read_json(path)['last_deposit_check'] == '2026-08-30T00:00:00+09:00'
+
+
+def test_principal_zero_is_rejected(tmp_path):
+    """원금 0 이면 등락률을 못 낸다 — 0 나눗셈 대신 사유를 돌려준다."""
+    path = _principal_file(tmp_path, principal=0.0)
+    old = _swap(PRINCIPAL_FILE=path,
+                _upbit_get=lambda p, params: (200, []))
+    try:
+        principal, err = cdr._load_principal(cdr._parse_iso(NOW))
+    finally:
+        _restore(old)
+    assert principal is None and '0 이하' in err
+
+
+# ── 미실행 블록 / 과거 날짜 / redaction ──
+def test_upbit_value_shown_even_when_upbit_did_not_run(tmp_path):
+    """업비트가 미실행이어도 평가액은 싣는다 — 그럴 때일수록 실계좌 확인이 급하다."""
+    sides = _spot_sides(tmp_path)
+    missing = cdr.SideResult('업비트', os.path.join(str(tmp_path), 'nope.log'))
+    missing.parse(DAY)
+    sides[0] = missing
+
+    body, warn = cdr.build_report(DAY, sides, None,
+                                  {'value': 2100000.0, 'pct': 5.0, 'note': ''})
+    block = body.split('[바낸현물]')[0]
+    assert '[업비트] ⚠️ 미실행' in block
+    assert '  평가액: 2,100,000원 (+5.0%)' in block
+    assert warn is True                      # 미실행 자체의 warn 은 그대로
+
+
+def test_upbit_value_skipped_for_past_date(tmp_path):
+    """--date 로 과거를 볼 땐 '지금' 잔고를 붙이지 않는다 (원금 동기화도 안 돈다)."""
+    called = []
+    old = _swap(_upbit_account_value=lambda: called.append('v') or (1.0, ''),
+                _load_principal=lambda now: called.append('p') or (1.0, ''))
+    try:
+        past = cdr._upbit_value_for('2020-01-01')
+        today = cdr._upbit_value_for(cdr._service_today())
+    finally:
+        _restore(old)
+
+    assert past is None and called == ['v', 'p']      # 과거 조회는 호출 자체가 없다
+    assert today == {'value': 1.0, 'pct': 0.0, 'note': ''}
+
+
+def test_upbit_value_for_swallows_api_errors(tmp_path):
+    """외부 API 가 터져도 리포트 본체는 나가야 한다 — note 만 남기고 값은 None."""
+    def boom():
+        raise RuntimeError('업비트 5xx')
+
+    old = _swap(_upbit_account_value=boom)
+    try:
+        uv = cdr._upbit_value_for(cdr._service_today())
+    finally:
+        _restore(old)
+    assert uv['value'] is None and uv['pct'] is None and '업비트 5xx' in uv['note']
+
+
+def test_redact_masks_upbit_keys_and_bearer(tmp_path):
+    """업비트 키/JWT 가 예외 메시지로 새 나가지 않는다 (텔레그램 마스킹은 그대로)."""
+    old = _swap(UPBIT_ACCESS_KEY='AK-SECRET-1234', UPBIT_SECRET_KEY='SK-SECRET-5678')
+    try:
+        out = cdr._redact('HTTP 401 key=AK-SECRET-1234 sec=SK-SECRET-5678 '
+                          'Authorization: Bearer eyJhbG.ciOiJI-UzI1NiJ9 '
+                          'bot123456:AAH-fake_token')
+    finally:
+        _restore(old)
+
+    assert 'AK-SECRET-1234' not in out and 'SK-SECRET-5678' not in out
+    assert 'eyJhbG.ciOiJI-UzI1NiJ9' not in out and 'Bearer <REDACTED>' in out
+    assert 'bot<REDACTED>' in out and 'AAH-fake_token' not in out
+
+
+def test_now_kst_is_always_tz_aware(tmp_path):
+    """ZoneInfo 가 없어도 UTC+9 고정 오프셋 — naive 로 새면 입금 시각 비교가 터진다."""
+    assert cdr._now_kst().tzinfo is not None
+    old = _swap(ZoneInfo=None)
+    try:
+        now = cdr._now_kst()
+        parsed = cdr._parse_iso('2026-09-01T09:20:00')      # tz 표기 없는 입력
+    finally:
+        _restore(old)
+    assert now.utcoffset() == cdr.KST_FIXED.utcoffset(None)
+    assert parsed is not None and parsed.utcoffset() == cdr.KST_FIXED.utcoffset(None)
 
 
 # ─── pytest 없는 환경(오라클 .venv)용 최소 러너 — pytest 스타일은 그대로 ───

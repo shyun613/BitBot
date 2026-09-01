@@ -21,6 +21,7 @@
 
   [업비트] 09:05:58 (LIVE) ✅ 거래 완료
     타겟: BTC 33.3%, ETH 33.3%, SOL 33.3% (cash=0.0%)
+    평가액: 2,100,000원 (+5.0%)
 
   [바낸현물] 09:05:38 (dry) cycle=09055998 ✅ 거래 완료
     타겟: BTC 33.3%, ETH 33.3%, SOL 33.3% (cash=0.0%)
@@ -39,6 +40,10 @@
   블록의 '카나리:' 줄은 평상시(전 멤버 ON·양쪽 일치)엔 생략하고, OFF·판별 불가·불일치·
   한쪽 미실행일 때만 싣는다. 비교 섹션의 카나리 판정 줄은 항상 나온다.
 
+  '평가액:' 줄은 업비트(실거래 계좌)에만 붙는다. 원금은 trade/report_principal.json
+  ({"principal_krw": ..., "last_deposit_check": ...})에 두고 KRW 입금분만 자동 가산한다.
+  출금은 조회 권한이 없어 자동 반영되지 않으니 출금 시 이 파일을 수동으로 낮춰야 한다.
+
 날짜 기준:
   서비스 날짜는 KST(Asia/Seoul) 기준 '오늘'. 로그 타임스탬프는 서버 로컬시각(UTC)이므로
   KST 09:05 실행분은 같은 날짜의 UTC 00:05 로 기록된다 (KST 09시 이후 실행에 한해 날짜 일치).
@@ -54,11 +59,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -78,10 +84,17 @@ except ImportError:
     TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
+try:
+    from config import UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY  # noqa: E402
+except ImportError:
+    UPBIT_ACCESS_KEY = os.environ.get('UPBIT_ACCESS_KEY', '')
+    UPBIT_SECRET_KEY = os.environ.get('UPBIT_SECRET_KEY', '')
+
 
 TG_PREFIX = '비교리포트'
 WARN_HEADER = '⚠️ 점검 필요'
 KST_TZ = 'Asia/Seoul'
+KST_FIXED = timezone(timedelta(hours=9))   # tzdata 없는 환경용 고정 오프셋 fallback
 WEIGHT_TOL = 0.01  # 1%p 초과 시 불일치
 
 SIDES = [
@@ -93,15 +106,24 @@ SIDES = [
 FUT_NAME = '선물'
 FUT_LOG = os.path.join(TRADE_DIR, 'binance_trade.log')
 
+# 업비트 실계좌 평가액/원금 (업비트 블록에만 싣는다 — 바낸현물·선물은 대상 아님)
+UPBIT_API = 'https://api.upbit.com'
+UPBIT_HTTP_TIMEOUT = 10
+PRINCIPAL_FILE = os.path.join(TRADE_DIR, 'report_principal.json')
+
 # ─── 토큰/URL redaction (m2 — common/notify.py 는 지인 공용 코드라 수정 금지) ───
 _TOKEN_RE = re.compile(r'bot\d+:[A-Za-z0-9_\-]+')
+# 업비트 JWT 는 예외 메시지/urllib 오류에 헤더째 실려 나올 수 있다
+_BEARER_RE = re.compile(r'Bearer [A-Za-z0-9._\-]+')
 
 
 def _redact(text: str) -> str:
     out = _TOKEN_RE.sub('bot<REDACTED>', str(text))
     out = re.sub(r'(api\.telegram\.org/)[^\s\'"]+', r'\1<REDACTED>', out)
-    if TELEGRAM_BOT_TOKEN:
-        out = out.replace(TELEGRAM_BOT_TOKEN, '<REDACTED>')
+    out = _BEARER_RE.sub('Bearer <REDACTED>', out)
+    for secret in (TELEGRAM_BOT_TOKEN, UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY):
+        if secret:
+            out = out.replace(secret, '<REDACTED>')
     return out
 
 
@@ -965,6 +987,249 @@ def _service_today() -> str:
     return datetime.now().strftime('%Y-%m-%d')
 
 
+# ─── 업비트 실계좌 평가액 / 원금 ───
+def _kst_tz():
+    """KST tzinfo — tzdata 가 없는 환경에서도 UTC+9 고정 오프셋으로 항상 tz-aware."""
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(KST_TZ)
+        except Exception:
+            pass
+    return KST_FIXED
+
+
+def _now_kst() -> datetime:
+    """KST(Asia/Seoul) 기준 현재 시각 (항상 tz-aware)."""
+    return datetime.now(_kst_tz())
+
+
+def _parse_iso(s: str) -> Optional[datetime]:
+    """ISO8601 → tz-aware datetime. tz 표기가 없으면 KST 로 본다 (업비트 시각 규약)."""
+    try:
+        dt = datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=_kst_tz())
+
+
+def _upbit_get(path: str, params: Dict[str, object]) -> Tuple[int, object]:
+    """업비트 private GET (JWT 인증). (status, json) 반환.
+
+    private HTTP 는 여기 한 곳에만 둔다 — 테스트는 이 함수만 갈아끼우면 네트워크를 타지 않는다.
+    pyupbit 를 쓰지 않는 이유: 그쪽 내부 requests 호출엔 timeout 이 없어, 업비트가 응답을
+    안 주면 리포트 cron 이 통째로 매달린다. 여기선 UPBIT_HTTP_TIMEOUT 을 반드시 건다.
+    jwt(PyJWT) 는 requirements.txt 에 없지만 pyupbit 의 의존성이라 함께 깔려 있다.
+    그래서 import 는 함수 안에서만 한다 (없는 환경에서도 모듈 import 는 살아 있어야 한다).
+    """
+    import hashlib
+    import urllib.parse
+    import urllib.request
+    import uuid
+
+    import jwt
+
+    query = urllib.parse.urlencode(params, doseq=True)
+    payload = {'access_key': UPBIT_ACCESS_KEY, 'nonce': str(uuid.uuid4())}
+    if query:
+        payload['query_hash'] = hashlib.sha512(query.encode()).hexdigest()
+        payload['query_hash_alg'] = 'SHA512'
+    token = jwt.encode(payload, UPBIT_SECRET_KEY, algorithm='HS256')
+    if isinstance(token, bytes):        # PyJWT 1.x 는 bytes 를 준다
+        token = token.decode()
+    url = f'{UPBIT_API}{path}' + (f'?{query}' if query else '')
+    req = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'})
+    with urllib.request.urlopen(req, timeout=UPBIT_HTTP_TIMEOUT) as resp:
+        status = getattr(resp, 'status', None) or resp.getcode()
+        return status, json.loads(resp.read().decode('utf-8'))
+
+
+def _upbit_public_get(path: str, params: Dict[str, object]) -> Tuple[int, object]:
+    """업비트 public GET (인증 없음). (status, json) 반환 — private 과 같은 timeout."""
+    import urllib.parse
+    import urllib.request
+
+    query = urllib.parse.urlencode(params, doseq=True)
+    url = f'{UPBIT_API}{path}' + (f'?{query}' if query else '')
+    with urllib.request.urlopen(urllib.request.Request(url),
+                                timeout=UPBIT_HTTP_TIMEOUT) as resp:
+        status = getattr(resp, 'status', None) or resp.getcode()
+        return status, json.loads(resp.read().decode('utf-8'))
+
+
+def _upbit_prices(currencies: List[str]) -> Dict[str, float]:
+    """보유 코인 현재가를 배치 1회로 조회한다 (market -> 현재가).
+
+    /v1/ticker 는 markets 를 콤마로 이어 한 번에 물어볼 수 있다 — 심볼 수만큼 때리면
+    레이트리밋에 걸린다. 비상장(KRW 마켓 없음) 심볼이 섞이면 응답에서 빠지거나 400 이
+    나는데, 어느 쪽이든 '없는 가격'으로 취급한다 (호출부가 0 + 메모로 fail-loud).
+    """
+    markets = ','.join(f'KRW-{c}' for c in currencies)
+    try:
+        status, body = _upbit_public_get('/v1/ticker', {'markets': markets})
+    except Exception:
+        return {}
+    if status != 200 or not isinstance(body, list):
+        return {}
+    out: Dict[str, float] = {}
+    for t in body:
+        if not isinstance(t, dict):
+            continue
+        market = str(t.get('market') or '')
+        try:
+            price = float(t.get('trade_price'))
+        except (TypeError, ValueError):
+            continue
+        if market and price > 0:
+            out[market] = price
+    return out
+
+
+def _upbit_account_value() -> Tuple[Optional[float], str]:
+    """업비트 실계좌 평가액(KRW). (총액, 메모) — 조회 자체가 실패하면 (None, 사유).
+
+    KRW 잔고는 그대로, 코인은 (balance + locked) × 현재가. 현재가를 못 받은 심볼은
+    0 으로 두되 메모에 심볼명을 남긴다 — 조용히 빠지면 등락률이 거짓말이 된다 (fail-loud).
+    가격 배치 조회가 통째로 실패해도 KRW 잔고만이라도 돌려주고 심볼을 전부 메모에 싣는다.
+    """
+    if not (UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY):
+        return None, '업비트 키 미설정'
+    try:
+        status, body = _upbit_get('/v1/accounts', {})
+    except Exception as e:
+        return None, f'잔고 조회 실패: {_redact(e)[:60]}'
+    if status != 200 or not isinstance(body, list):
+        return None, f'잔고 조회 실패 (HTTP {status})'
+
+    total, bad = 0.0, []
+    holdings: Dict[str, float] = {}
+    for b in body:
+        if not isinstance(b, dict):
+            continue
+        cur = str(b.get('currency') or '').upper()
+        try:
+            amt = float(b.get('balance') or 0) + float(b.get('locked') or 0)
+        except (TypeError, ValueError):
+            bad.append(cur or '?')
+            continue
+        if amt <= 0:
+            continue
+        if cur == 'KRW':
+            total += amt
+        else:
+            holdings[cur] = holdings.get(cur, 0.0) + amt
+
+    if holdings:
+        prices = _upbit_prices(sorted(holdings))
+        for cur, amt in sorted(holdings.items()):
+            price = prices.get(f'KRW-{cur}')
+            if not price:
+                bad.append(cur)
+                continue
+            total += amt * price
+    err = f'가격 조회 실패: {", ".join(sorted(set(bad)))}' if bad else ''
+    return total, err
+
+
+def _save_principal(data: Dict[str, object]) -> None:
+    """원금 상태 원자적 저장 (tmp + os.replace — 프로젝트 상태파일 규칙).
+
+    tmp 이름에 pid 를 붙인다 — 같은 파일을 두 프로세스가 동시에 쓰면 서로의 tmp 를
+    덮어써 절반짜리 상태가 replace 될 수 있다.
+    """
+    tmp = f'{PRINCIPAL_FILE}.tmp.{os.getpid()}'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, PRINCIPAL_FILE)
+
+
+def _load_principal(now: datetime) -> Tuple[Optional[float], str]:
+    """원금(KRW)을 읽고 새 입금분을 반영한다. (원금, 메모) — 못 쓰면 (None, 사유).
+
+    상태파일 trade/report_principal.json:
+      {"principal_krw": 2000000.0,
+       "last_deposit_check": "2026-08-31T10:00:00+09:00",
+       "processed_uuids": ["<그 시각에 이미 반영한 입금 uuid>", ...]}
+
+    워터마크는 '지금 시각'이 아니라 **관측한 입금의 max(done_at || created_at)** 으로만
+    전진한다. now 로 밀면, 반영이 늦어 done_at 이 과거인 채 나중에 나타나는 입금이
+    영영 창밖으로 밀려 유실된다. 같은 시각에 여러 건이 들어오는 경우를 위해 워터마크
+    시각의 입금 uuid 를 processed_uuids 에 남겨 중복 가산을 막는다.
+    가산 조건: ts > last, 또는 (ts == last 이고 uuid 가 processed_uuids 에 없음).
+    새 입금이 없으면 파일을 건드리지 않는다 (매일 같은 내용으로 쓰지 않는다).
+    아직 시각이 오지 않은(now 보다 미래) 입금은 이번엔 세지 않는다 — 워터마크를 미래로
+    밀면 그 사이 입금이 통째로 가려진다. 다음 실행에서 정상 반영된다.
+
+    limit=100 은 개인 계좌 입금 빈도상 충분하다 (한 번도 안 돈 사이에 신규 입금이
+    100건 넘게 쌓이면 초과분은 유실된다).
+
+    주의: 출금은 조회 권한이 없어 자동 반영되지 않는다 —
+          출금했을 땐 report_principal.json 의 principal_krw 를 수동으로 낮춰야 한다.
+    """
+    if not os.path.exists(PRINCIPAL_FILE):
+        return None, '원금 파일 없음(report_principal.json)'
+    try:
+        with open(PRINCIPAL_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        principal = float(data['principal_krw'])
+    except Exception as e:
+        return None, f'원금 파일 읽기 실패(report_principal.json): {_redact(e)[:60]}'
+    if principal <= 0:
+        return None, '원금이 0 이하 (report_principal.json)'
+
+    last = _parse_iso(data.get('last_deposit_check'))
+    if last is None:
+        return principal, '입금동기화 실패 (last_deposit_check 파싱 불가)'
+    seen = {str(u) for u in (data.get('processed_uuids') or [])}
+    try:
+        status, body = _upbit_get('/v1/deposits',
+                                  {'currency': 'KRW', 'limit': 100, 'order_by': 'desc'})
+    except Exception as e:
+        return principal, f'입금동기화 실패: {_redact(e)[:60]}'
+    if status != 200 or not isinstance(body, list):
+        return principal, f'입금동기화 실패 (HTTP {status})'
+
+    # (ts, uuid, amount) — KRW·ACCEPTED·시각 파싱 성공분만
+    deposits: List[Tuple[datetime, str, float]] = []
+    for d in body:
+        if not isinstance(d, dict):
+            continue
+        if str(d.get('currency') or '').upper() != 'KRW':
+            continue
+        if str(d.get('state') or '').upper() != 'ACCEPTED':
+            continue
+        ts = _parse_iso(d.get('done_at') or d.get('created_at'))
+        if ts is None or ts < last or ts > now:
+            continue
+        try:
+            amount = float(d.get('amount') or 0)
+        except (TypeError, ValueError):
+            continue
+        # uuid 가 비면 중복 판정 키가 없어 다음 실행에 또 더해진다 — 대체 키를 만든다
+        uid = str(d.get('uuid') or '') or f'{ts.isoformat()}#{amount}'
+        deposits.append((ts, uid, amount))
+
+    fresh = [(ts, uid, amt) for ts, uid, amt in deposits
+             if ts > last or uid not in seen]
+    if not fresh:
+        return principal, ''
+
+    principal += sum(amt for _ts, _uid, amt in fresh)
+    watermark = max(ts for ts, _uid, _amt in fresh)
+    # 워터마크 시각의 입금은 '이미 반영됨'으로 남긴다 (같은 시각 신규 건과 구분하려고)
+    processed = {uid for ts, uid, _amt in deposits if ts == watermark and uid}
+    if watermark == last:
+        processed |= seen
+
+    data['principal_krw'] = principal
+    data['last_deposit_check'] = watermark.isoformat()
+    data['processed_uuids'] = sorted(processed)
+    try:
+        _save_principal(data)
+    except Exception as e:
+        return principal, f'원금 파일 저장 실패: {_redact(e)[:60]}'
+    return principal, ''
+
+
 # ─── 리포트 ───
 def _spot_canary_visible(sides: List[SideResult]) -> bool:
     """현물 블록에 카나리 줄을 실을지.
@@ -987,6 +1252,23 @@ def _spot_canary_visible(sides: List[SideResult]) -> bool:
 def _mode_word(s: SideResult) -> str:
     """비교 섹션의 실행 모드 표기 — 판정이 아니라 정보 표시용."""
     return '?' if s.dry_run is None else ('dry-run' if s.dry_run else 'LIVE')
+
+
+def _upbit_value_line(uv: Dict[str, object]) -> Tuple[str, bool]:
+    """[업비트] 블록의 '평가액' 줄 (줄, 경고여부).
+
+    uv = {'value': 평가액(KRW) | None, 'pct': 원금대비 등락률(%) | None, 'note': 메모}
+    값이나 원금이 없으면 숫자를 지어내지 않고 사유를 싣는다 (fail-loud).
+    """
+    value, pct = uv.get('value'), uv.get('pct')
+    note = str(uv.get('note') or '').strip()
+    if value is None:
+        return f'  평가액: 조회 실패 — {note or "사유 불명"}', True
+    if pct is None:
+        return f'  평가액: {value:,.0f}원 (원금 미설정 — {note or "사유 불명"})', True
+    if note:   # 값은 나왔지만 일부 심볼 가격 누락 등 — 평가액이 과소일 수 있다
+        return f'  평가액: {value:,.0f}원 ({pct:+.1f}%) — {note}', True
+    return f'  평가액: {value:,.0f}원 ({pct:+.1f}%)', False
 
 
 def _fut_lines(fut: 'FutResult') -> Tuple[List[str], bool]:
@@ -1025,11 +1307,14 @@ def _fut_lines(fut: 'FutResult') -> Tuple[List[str], bool]:
 
 
 def build_report(day: str, sides: List[SideResult],
-                 fut: Optional['FutResult'] = None) -> Tuple[str, bool]:
+                 fut: Optional['FutResult'] = None,
+                 upbit_value: Optional[Dict[str, object]] = None) -> Tuple[str, bool]:
     """(본문, 경고여부) 반환.
 
     sides = 현물 2축(업비트/바낸현물) — 서로 1:1 비교한다.
     fut   = 선물(V25) — 전략·자산이 달라 비교하지 않고 결과만 싣는다 (None 이면 생략).
+    upbit_value = {'value': 평가액|None, 'pct': 등락률|None, 'note': 메모} — 업비트 블록에만
+            '평가액' 줄을 더한다. None(미주입)이면 줄 자체가 없고 출력은 종전과 완전히 같다.
 
     블록의 '카나리' 줄은 이상할 때만 싣는다(_spot_canary_visible / FutResult.canary_visible).
     '── 현물 비교 ──' 의 카나리 일치/불일치 판정은 그대로 항상 나온다.
@@ -1054,6 +1339,10 @@ def build_report(day: str, sides: List[SideResult],
             elif s.log_exists:
                 reason += ' (원인 후보: cron 미실행 / 래퍼 flock / health lock — 로그에 흔적 없음)'
             lines.append(f'\n[{s.name}] ⚠️ 미실행 — {reason}')
+            # 미실행일수록 실계좌 상태 확인이 급하다 — 업비트면 평가액은 그래도 싣는다
+            if upbit_value is not None and s is a:
+                vline, _vwarn = _upbit_value_line(upbit_value)
+                lines.append(vline)
             continue
         icon = RESULT_ICONS.get(s.result_kind, '⚠️')
         if s.result_kind in ('error', 'warn', 'unknown'):
@@ -1066,6 +1355,11 @@ def build_report(day: str, sides: List[SideResult],
         if show_canary:
             lines.append(f'  카나리: {s.canary_str()}')
         lines.append(f'  타겟: {s.target_str()}')
+        # 실계좌 평가액은 업비트(sides[0]) 블록에만 — 바낸현물/선물은 대상이 아니다
+        if upbit_value is not None and s is a:
+            vline, vwarn = _upbit_value_line(upbit_value)
+            lines.append(vline)
+            warn = warn or vwarn
         if s.issues:
             lines.append(f'  이슈: {", ".join(s.issues)}')
 
@@ -1172,6 +1466,26 @@ def build_report(day: str, sides: List[SideResult],
     return '\n'.join(lines), warn
 
 
+def _upbit_value_for(day: str) -> Optional[Dict[str, object]]:
+    """그 날 리포트에 실을 업비트 평가액 정보 (오늘이 아니면 None → 줄 생략).
+
+    실계좌 조회는 '지금' 값이라 과거 --date 리포트에 붙이면 그 날 상태로 오해된다.
+    원금 동기화가 상태파일을 쓰는 것도 오늘치 실행에서만 일어나야 한다.
+    외부 API 라 통째로 감싼다 — 여기서 터져도 리포트 본체(로그 파싱분)는 나가야 한다.
+    """
+    if day != _service_today():
+        return None
+    try:
+        value, verr = _upbit_account_value()
+        principal, perr = _load_principal(_now_kst())
+        pct = ((value - principal) / principal * 100
+               if value is not None and principal else None)
+        return {'value': value, 'pct': pct,
+                'note': '; '.join(p for p in (verr, perr) if p)}
+    except Exception as e:
+        return {'value': None, 'pct': None, 'note': _redact(e)[:80]}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='일일 운용 리포트 (업비트/바낸현물 비교 + 선물 결과)')
@@ -1193,7 +1507,7 @@ def main():
         fut = FutResult(FUT_NAME, FUT_LOG)
         fut.parse(day)
 
-    body, warn = build_report(day, sides, fut)
+    body, warn = build_report(day, sides, fut, _upbit_value_for(day))
     if warn:
         body = WARN_HEADER + '\n' + body
 
