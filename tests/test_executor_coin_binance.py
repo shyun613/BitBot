@@ -1370,16 +1370,19 @@ class _EngineSpy:
     """엔진에 들어간 state / cur_w 를 호출 시점 스냅샷으로 기록."""
 
     def __init__(self, combined=None, any_new_bar=True, drift_fire=False, all_fresh=True,
-                 mutate=None):
+                 mutate=None, raise_exc=False):
         self.calls = []
         self.combined = dict(combined if combined is not None else _REF_SNAP)
         self.any_new_bar = any_new_bar
         self.drift_fire = drift_fire
         self.all_fresh = all_fresh
         self.mutate = mutate      # 엔진이 state 를 바꾸는 상황(refill v2 등) 재현용
+        self.raise_exc = raise_exc
 
     def __call__(self, state, session, cache_dir, **kw):
         self.calls.append({'state': copy.deepcopy(state), 'cur_w': copy.deepcopy(kw.get('cur_w'))})
+        if self.raise_exc:
+            raise RuntimeError('engine boom')
         # 실 엔진과 같이 이번 결과를 state 에 써 둔다 — 같은 봉이면 stale 값이 저장된다
         _ts = ecb.cle.to_utc_iso(ecb.cle.utc_now())
         state['last_target_snapshot'] = dict(self.combined, _ts=_ts)
@@ -1390,7 +1393,8 @@ class _EngineSpy:
                                  drift_fire=self.drift_fire, all_fresh=self.all_fresh)
 
 
-def _run_with_ref(state_ref, dry_run=True, own_state=None, spy=None, client=None):
+def _run_with_ref(state_ref, dry_run=True, own_state=None, spy=None, client=None,
+                  upbit_status=None):
     """엔진/업비트 조회를 스텁한 채 run_once 1회. (rc, spy, 자체 state 경로)"""
     if client is None:
         client = FakeClient(balances={'USDT': (25.0, 0.0)}, strict_no_orders=dry_run)
@@ -1398,7 +1402,7 @@ def _run_with_ref(state_ref, dry_run=True, own_state=None, spy=None, client=None
     spy = spy if spy is not None else _EngineSpy()
     orig = (ecb.cle.fetch_upbit_market_status, ecb.cle.compute_live_targets,
             ecb.STATE_FILE, ecb._send_tg)
-    ecb.cle.fetch_upbit_market_status = lambda session: {}
+    ecb.cle.fetch_upbit_market_status = lambda session: dict(upbit_status or {})
     ecb.cle.compute_live_targets = spy
     ecb.STATE_FILE = '__state_ref_own__.json'
     ecb._send_tg = lambda *a, **kw: None      # live 경로에서도 텔레그램 발송 금지
@@ -2063,6 +2067,343 @@ def test_state_ref_live_seed_same_bar_restores_members_and_recomputes_drift():
             with open(state_path, encoding='utf-8') as f:
                 saved = json.load(f)
             assert saved['members'] == _ref_state_seed_refill()['members'], saved['members']
+
+
+def test_state_ref_live_seed_same_bar_respects_drift_disabled():
+    """엔진의 snap-only 스위치(DRIFT_ENABLED=False)를 시드 drift 재계산이 우회하지 않는다."""
+    orig = ecb.cle.DRIFT_ENABLED
+    ecb.cle.DRIFT_ENABLED = False
+    try:
+        with _WalDir():
+            with tempfile.TemporaryDirectory() as rd:
+                st = _ref_state_seed_refill()
+                st['spot_cash_buffer'] = 0.0     # cash buffer drift 재평가 자체를 끈다
+                p = _write_ref(rd, st)
+                client = FakeClient(symbols=_REF_SYMBOLS, prices=_REF_PRICES,
+                                    balances={'USDT': (1000.0, 0.0)}, strict_no_orders=True)
+                spy = _EngineSpy(combined={'BTC': 0.5, 'DOGE': 0.5}, any_new_bar=False)
+                rc, spy, state_path = _run_with_ref(p, dry_run=False, spy=spy, client=client)
+
+                assert rc == 0, (rc, LOG_LINES)
+                # ht 는 임계 이상으로 계산되지만 스위치가 꺼져 있어 발화하지 않는다
+                assert any('재계산: ht=1.0000' in l and 'drift_enabled=False' in l
+                           for l in LOG_LINES), LOG_LINES
+                assert any('drift_fire=False' in l for l in LOG_LINES), LOG_LINES
+                assert not any('drift 발화' in l for l in LOG_LINES), LOG_LINES
+                assert any('target 불변' in l for l in LOG_LINES), LOG_LINES
+                assert client.submissions == [], client.submissions
+                with open(state_path, encoding='utf-8') as f:
+                    saved = json.load(f)
+                assert saved['members'] == _ref_state_seed_refill()['members'], saved['members']
+    finally:
+        ecb.cle.DRIFT_ENABLED = orig
+
+
+def test_state_ref_live_seed_same_bar_purges_newly_warned_coin():
+    """참조 기록 이후 유의 전환된 코인은 target·members 어디에서도 되살아나지 않는다."""
+    with _WalDir():
+        with tempfile.TemporaryDirectory() as rd:
+            st = _ref_state()                       # 최종 target·스냅샷 모두 BTC/ETH/SOL
+            st['spot_cash_buffer'] = 0.0
+            p = _write_ref(rd, st)
+            client = FakeClient(symbols=_REF_SYMBOLS, prices=_REF_PRICES,
+                                balances={'USDT': (1000.0, 0.0)})
+            spy = _EngineSpy(combined={'BTC': 0.5, 'DOGE': 0.5}, any_new_bar=False)
+            rc, spy, state_path = _run_with_ref(
+                p, dry_run=False, spy=spy, client=client,
+                upbit_status={'SOL': {'warning': True, 'listed': True},
+                              'BTC': {'warning': False, 'listed': True},
+                              'ETH': {'warning': False, 'listed': True}})
+
+            assert rc == 0, (rc, LOG_LINES)
+            assert any("유의/상폐 전환 코인 ['SOL']" in l for l in LOG_LINES), LOG_LINES
+            cline = [l for l in LOG_LINES if l.startswith('  combined target: ')]
+            assert len(cline) == 1 and 'SOL' not in cline[0], cline
+            assert 'cash=33.3%' in cline[0], cline          # SOL 비중이 현금으로 넘어갔다
+            syms = [(s['symbol'], s['side']) for s in client.submissions]
+            assert not any(sym == 'SOLUSDT' and side == 'BUY' for sym, side in syms), syms
+            assert ('BTCUSDT', 'BUY') in syms and ('ETHUSDT', 'BUY') in syms, syms
+
+            with open(state_path, encoding='utf-8') as f:
+                saved = json.load(f)
+            snaps = saved['members'][_REF_MEMBER]['snapshots']
+            assert all('SOL' not in s for s in snaps), snaps
+            assert all(abs(s.get('CASH', 0.0) - _REF_SNAP['SOL']) < 1e-9 for s in snaps), snaps
+            assert 'SOL' not in saved['last_target_snapshot'], saved['last_target_snapshot']
+
+
+def test_state_ref_live_after_seed_never_reads_reference():
+    """시드가 끝난 live 는 참조가 깨져 있어도 정상 운영한다 (참조 파일을 읽지 않는다)."""
+    own = {
+        'schema_version': ecb.cle.SCHEMA_VERSION,
+        'members': {_REF_MEMBER: _ref_member(
+            snapshots=[{'CASH': 1.0} for _ in range(ecb.cle.MEMBERS[_REF_MEMBER]['n_snapshots'])],
+            canary_on=False, bar_counter=5, last_combined={'CASH': 1.0})},
+        'last_target_snapshot': {'Cash': 1.0, '_ts': _REF_TS},
+    }
+    with _WalDir():
+        with tempfile.TemporaryDirectory() as rd:
+            broken = os.path.join(rd, 'trade_state.json')
+            with open(broken, 'w', encoding='utf-8') as f:
+                f.write('{broken')                      # 로더가 통과시킬 수 없는 파일
+            spy = _EngineSpy(combined={'Cash': 1.0})
+            rc, spy, state_path = _run_with_ref(broken, dry_run=False, own_state=own, spy=spy)
+
+            assert rc == 0, (rc, LOG_LINES)
+            assert any('state-ref 무시' in l and '읽지 않음' in l for l in LOG_LINES), LOG_LINES
+            assert not any('참조 실패' in l for l in LOG_LINES), LOG_LINES
+            assert spy.calls[0]['state']['members'] == own['members'], spy.calls[0]['state']
+
+
+def test_state_ref_live_seed_same_bar_drops_stale_member_targets():
+    """참조에 last_member_targets 가 없으면 엔진의 stale 값을 자체 state 에 남기지 않는다."""
+    with _WalDir():
+        with tempfile.TemporaryDirectory() as rd:
+            st = _ref_state()
+            del st['last_member_targets']
+            st['spot_cash_buffer'] = 0.0
+            p = _write_ref(rd, st)
+            # 실잔고 = 참조 최종 target(BTC/ETH/SOL 1/3씩, PV $900) → drift 재계산 ≈ 0
+            client = FakeClient(symbols=_REF_SYMBOLS, prices=_REF_PRICES,
+                                balances={'BTC': (0.003, 0.0), 'ETH': (0.1, 0.0),
+                                          'SOL': (2.0, 0.0)}, strict_no_orders=True)
+            spy = _EngineSpy(combined={'BTC': 0.5, 'DOGE': 0.5}, any_new_bar=False)
+            rc, spy, state_path = _run_with_ref(p, dry_run=False, spy=spy, client=client)
+
+            assert rc == 0, (rc, LOG_LINES)
+            assert any('target 불변' in l for l in LOG_LINES), LOG_LINES
+            with open(state_path, encoding='utf-8') as f:
+                saved = json.load(f)
+            assert 'last_member_targets' not in saved, saved.get('last_member_targets')
+            assert saved['members'] == _ref_state()['members'], saved['members']
+
+
+def test_state_ref_live_seed_same_bar_skips_cash_buffer_drift_reeval():
+    """같은 봉 시드에서는 cash buffer drift 재평가를 건너뛴다 (임계 근처 자가 재발화 방지).
+
+    참조 최종 target = BTC/ETH 1/3 + Cash 1/3, buffer 2%.
+      · 재계산 ht(= apply_cash_buffer 기준)  ≈ 0.0960  < 0.10  → 발화 없음
+      · 옛 재평가 블록의 변환(Cash 미스케일) ≈ 0.1027 ≥ 0.10  → 건너뛰지 않으면 발화했다
+    """
+    with _WalDir():
+        with tempfile.TemporaryDirectory() as rd:
+            st = _ref_state()
+            st['spot_cash_buffer'] = 0.02
+            st['members'][_REF_MEMBER]['snapshots'] = [
+                {'BTC': 0.3333, 'ETH': 0.3333, 'CASH': 0.3334}
+                for _ in range(ecb.cle.MEMBERS[_REF_MEMBER]['n_snapshots'])]
+            st['members'][_REF_MEMBER]['last_combined'] = {'BTC': 0.3333, 'ETH': 0.3333,
+                                                           'CASH': 0.3334}
+            st['last_target_snapshot'] = {'BTC': 0.3333, 'ETH': 0.3333, 'Cash': 0.3334,
+                                          '_ts': _REF_TS}
+            st['last_member_targets'] = {_REF_MEMBER: {'BTC': 0.3333, 'ETH': 0.3333,
+                                                       'Cash': 0.3334, '_ts': _REF_TS}}
+            p = _write_ref(rd, st)
+            # PV $1,000 → Cash 44.27% / BTC 27.865% / ETH 27.865%
+            client = FakeClient(symbols=_REF_SYMBOLS, prices=_REF_PRICES,
+                                balances={'USDT': (442.7, 0.0), 'BTC': (0.0027865, 0.0),
+                                          'ETH': (0.0928833, 0.0)}, strict_no_orders=True)
+            spy = _EngineSpy(combined={'BTC': 0.5, 'DOGE': 0.5}, any_new_bar=False)
+            rc, spy, state_path = _run_with_ref(p, dry_run=False, spy=spy, client=client)
+
+            assert rc == 0, (rc, LOG_LINES)
+            assert any('재계산: ht=0.0960' in l for l in LOG_LINES), LOG_LINES
+            assert not any('cash buffer 반영 drift 재평가' in l for l in LOG_LINES), LOG_LINES
+            assert not any('drift 발화' in l for l in LOG_LINES), LOG_LINES
+            assert any('target 불변' in l for l in LOG_LINES), LOG_LINES
+            assert client.submissions == [], client.submissions
+
+
+def test_warned_coins_flag_and_absence_rules():
+    """flag 규칙은 종전 그대로, 부재 규칙은 후보 + 조회 성공일 때만."""
+    status = {'BTC': {'warning': False, 'listed': True},
+              'ETH': {'warning': True, 'listed': True},
+              'ADA': {'warning': False, 'listed': False}}
+    assert ecb._warned_coins(status) == {'ETH', 'ADA'}, ecb._warned_coins(status)
+    # 후보를 주면 목록에 없는 코인은 상폐로 본다
+    assert ecb._warned_coins(status, ['BTC', 'SOL']) == {'ETH', 'ADA', 'SOL'}
+    # 조회 실패(빈 맵)면 아무것도 추론하지 않는다
+    assert ecb._warned_coins({}, ['BTC', 'SOL']) == set()
+    assert ecb._warned_coins(None, ['SOL']) == set()
+    # 현금/메타 키는 상폐 후보가 아니다
+    assert ecb._warned_coins(status, ['Cash', 'CASH', 'cash', '_ts']) == {'ETH', 'ADA'}
+
+
+def test_live_new_bar_cash_buffer_reeval_respects_drift_disabled():
+    """DRIFT_ENABLED=False 면 cash buffer drift 재평가도 drift 를 되살리지 않는다 (새 봉 경로)."""
+    orig = ecb.cle.DRIFT_ENABLED
+    ecb.cle.DRIFT_ENABLED = False
+    try:
+        with _WalDir():
+            with tempfile.TemporaryDirectory() as rd:
+                p = _write_ref(rd)                  # buffer 키 없음 → 기본 2% 로 재평가 블록 진입
+                client = FakeClient(symbols=_REF_SYMBOLS, prices=_REF_PRICES,
+                                    balances={'USDT': (1000.0, 0.0)}, strict_no_orders=True)
+                # 새 봉 경로 (any_new_bar=True) — 같은 봉 override 가 개입하지 않는다
+                spy = _EngineSpy(combined=dict(_REF_SNAP), any_new_bar=True)
+                rc, spy, state_path = _run_with_ref(p, dry_run=False, spy=spy, client=client)
+
+                assert rc == 0, (rc, LOG_LINES)
+                assert not any('drift 재평가' in l and 'fire' in l for l in LOG_LINES), LOG_LINES
+                assert not any('drift 발화' in l for l in LOG_LINES), LOG_LINES
+                assert any('drift_fire=False' in l for l in LOG_LINES), LOG_LINES
+                assert any('target 불변' in l for l in LOG_LINES), LOG_LINES
+                assert client.submissions == [], client.submissions
+    finally:
+        ecb.cle.DRIFT_ENABLED = orig
+
+
+def test_state_ref_live_seed_same_bar_purges_coin_missing_from_status():
+    """상태 맵에 아예 없는 코인(완전 상폐)도 참조 target/members 에서 빼고 현금으로 돌린다."""
+    with _WalDir():
+        with tempfile.TemporaryDirectory() as rd:
+            st = _ref_state()                       # 최종 target·스냅샷 모두 BTC/ETH/SOL
+            st['spot_cash_buffer'] = 0.0
+            p = _write_ref(rd, st)
+            client = FakeClient(symbols=_REF_SYMBOLS, prices=_REF_PRICES,
+                                balances={'USDT': (1000.0, 0.0)})
+            spy = _EngineSpy(combined={'BTC': 0.5, 'DOGE': 0.5}, any_new_bar=False)
+            rc, spy, state_path = _run_with_ref(
+                p, dry_run=False, spy=spy, client=client,
+                # 조회는 성공했고(비어있지 않음) SOL 항목만 없다 = KRW 마켓에서 사라짐
+                upbit_status={'BTC': {'warning': False, 'listed': True},
+                              'ETH': {'warning': False, 'listed': True}})
+
+            assert rc == 0, (rc, LOG_LINES)
+            assert any("목록 부재(상폐)=['SOL']" in l for l in LOG_LINES), LOG_LINES
+            cline = [l for l in LOG_LINES if l.startswith('  combined target: ')]
+            assert len(cline) == 1 and 'SOL' not in cline[0], cline
+            syms = [(s['symbol'], s['side']) for s in client.submissions]
+            assert not any(sym == 'SOLUSDT' and side == 'BUY' for sym, side in syms), syms
+            with open(state_path, encoding='utf-8') as f:
+                saved = json.load(f)
+            assert all('SOL' not in s for s in saved['members'][_REF_MEMBER]['snapshots'])
+            assert 'SOL' not in saved['last_target_snapshot'], saved['last_target_snapshot']
+
+
+def test_state_ref_live_seed_same_bar_no_purge_when_status_fetch_failed():
+    """상태 조회 실패(빈 맵)면 상폐와 장애를 구분할 수 없으므로 아무것도 빼지 않는다."""
+    with _WalDir():
+        with tempfile.TemporaryDirectory() as rd:
+            st = _ref_state()
+            st['spot_cash_buffer'] = 0.0
+            p = _write_ref(rd, st)
+            # 실잔고 = 참조 최종 target → drift 없음, 스킵 경로 (주문 없이 저장만)
+            client = FakeClient(symbols=_REF_SYMBOLS, prices=_REF_PRICES,
+                                balances={'BTC': (0.003, 0.0), 'ETH': (0.1, 0.0),
+                                          'SOL': (2.0, 0.0)}, strict_no_orders=True)
+            spy = _EngineSpy(combined={'BTC': 0.5, 'DOGE': 0.5}, any_new_bar=False)
+            rc, spy, state_path = _run_with_ref(p, dry_run=False, spy=spy, client=client,
+                                                upbit_status={})
+
+            assert rc == 0, (rc, LOG_LINES)
+            assert not any('유의/상폐 전환 코인' in l for l in LOG_LINES), LOG_LINES
+            cline = [l for l in LOG_LINES if l.startswith('  combined target: ')]
+            assert len(cline) == 1 and 'SOL' in cline[0], cline
+            with open(state_path, encoding='utf-8') as f:
+                saved = json.load(f)
+            assert all('SOL' in s for s in saved['members'][_REF_MEMBER]['snapshots'])
+            assert 'SOL' in saved['last_target_snapshot'], saved['last_target_snapshot']
+
+
+def test_state_ref_live_seed_new_bar_purges_before_engine_call():
+    """새 봉 경로의 시드도 엔진 호출 전에 정화된다 — 상폐 코인이 스냅샷에 남아 매수되면 안 된다."""
+    with _WalDir():
+        with tempfile.TemporaryDirectory() as rd:
+            st = _ref_state()                       # 최종 target·스냅샷 모두 BTC/ETH/SOL
+            p = _write_ref(rd, st)
+            client = FakeClient(symbols=_REF_SYMBOLS, prices=_REF_PRICES,
+                                balances={'USDT': (1000.0, 0.0)})
+            # 새 봉 경로 — 같은 봉 override 는 개입하지 않는다. 엔진은 SOL 없는 target 을 낸다.
+            spy = _EngineSpy(combined={'BTC': 0.5, 'ETH': 0.5}, any_new_bar=True)
+            rc, spy, state_path = _run_with_ref(
+                p, dry_run=False, spy=spy, client=client,
+                upbit_status={'BTC': {'warning': False, 'listed': True},
+                              'ETH': {'warning': False, 'listed': True}})
+
+            assert rc == 0, (rc, LOG_LINES)
+            assert any("목록 부재(상폐)=['SOL']" in l for l in LOG_LINES), LOG_LINES
+            # 엔진에 넘어간 state 에 SOL 이 남아있지 않다 (비중은 CASH 로)
+            seen = spy.calls[0]['state']
+            snaps = seen['members'][_REF_MEMBER]['snapshots']
+            assert all('SOL' not in s for s in snaps), snaps
+            assert all(abs(s.get('CASH', 0.0) - _REF_SNAP['SOL']) < 1e-9 for s in snaps), snaps
+            assert 'SOL' not in seen['members'][_REF_MEMBER]['last_combined'], seen['members']
+            assert 'SOL' not in seen['last_target_snapshot'], seen['last_target_snapshot']
+            # prev(참조 원본)에는 SOL 이 있었으므로 target 변경으로 잡혀 리밸런싱으로 간다
+            assert any('🔔 target 변경 감지' in l for l in LOG_LINES), LOG_LINES
+            syms = [(s['symbol'], s['side']) for s in client.submissions]
+            assert not any(sym == 'SOLUSDT' and side == 'BUY' for sym, side in syms), syms
+            assert ('BTCUSDT', 'BUY') in syms and ('ETHUSDT', 'BUY') in syms, syms
+
+
+def _own_state_for_early_exit():
+    """live 정상 운영 중인 자체 state — cash_buffer 만 있고 buffer_pct 는 없다.
+
+    run_once 는 시작 직후 buffer_pct 를 채우므로, 저장이 실제로 일어났는지 이 키로 판별한다.
+    """
+    return {
+        'schema_version': ecb.cle.SCHEMA_VERSION,
+        'members': {_REF_MEMBER: _ref_member(
+            snapshots=[{'CASH': 1.0} for _ in range(ecb.cle.MEMBERS[_REF_MEMBER]['n_snapshots'])],
+            canary_on=False, last_combined={'CASH': 1.0})},
+        'last_target_snapshot': {'Cash': 1.0, '_ts': _REF_TS},
+        'cash_buffer': 0.03,
+    }
+
+
+def _break_wal(cache_dir):
+    with open(os.path.join(cache_dir, ecb.ORDER_WAL_FILE), 'w', encoding='utf-8') as f:
+        f.write('{not json\n')
+
+
+def test_state_ref_live_seed_early_exit_does_not_save_state():
+    """시드 실행이 정상 계산 경로 전에 중단되면 state 를 저장하지 않는다 (재시드 가능)."""
+    cases = ('wal', 'cancel', 'engine')
+    for case in cases:
+        with _WalDir() as d:
+            with tempfile.TemporaryDirectory() as rd:
+                p = _write_ref(rd)
+                client = FakeClient(symbols=_REF_SYMBOLS, prices=_REF_PRICES,
+                                    balances={'USDT': (1000.0, 0.0)}, strict_no_orders=True)
+                spy = _EngineSpy()
+                if case == 'wal':
+                    _break_wal(d)
+                elif case == 'cancel':
+                    client.open_orders_error = 'open orders down'
+                else:
+                    spy = _EngineSpy(raise_exc=True)
+                rc, spy, state_path = _run_with_ref(p, dry_run=False, spy=spy, client=client)
+
+                assert rc == 2, (case, rc, LOG_LINES)
+                assert any('시드 state 저장 생략' in l for l in LOG_LINES), (case, LOG_LINES)
+                assert not os.path.exists(state_path), (case, state_path)
+                if case == 'engine':
+                    assert any('엔진 호출 실패' in l for l in LOG_LINES), LOG_LINES
+
+
+def test_live_early_exit_without_state_ref_still_saves_state():
+    """대조군 — state-ref 없는 live 실행의 조기 종료 저장은 종전 그대로다."""
+    for case in ('wal', 'cancel', 'engine'):
+        with _WalDir() as d:
+            client = FakeClient(symbols=_REF_SYMBOLS, prices=_REF_PRICES,
+                                balances={'USDT': (1000.0, 0.0)}, strict_no_orders=True)
+            spy = _EngineSpy(combined={'Cash': 1.0})
+            if case == 'wal':
+                _break_wal(d)
+            elif case == 'cancel':
+                client.open_orders_error = 'open orders down'
+            else:
+                spy = _EngineSpy(raise_exc=True)
+            rc, spy, state_path = _run_with_ref(None, dry_run=False, spy=spy, client=client,
+                                                own_state=_own_state_for_early_exit())
+
+            assert rc == 2, (case, rc, LOG_LINES)
+            assert not any('시드 state 저장 생략' in l for l in LOG_LINES), (case, LOG_LINES)
+            with open(state_path, encoding='utf-8') as f:
+                saved = json.load(f)
+            # 저장이 실제로 일어났다 (run_once 가 채운 buffer_pct 가 파일에 있다)
+            assert saved.get('buffer_pct') == 0.03, (case, saved)
 
 
 def test_engine_same_bar_target_is_order_independent():

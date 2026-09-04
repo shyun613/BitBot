@@ -58,8 +58,16 @@ dry-run 규약 (억제 범위 명시):
              (시드 때 참조의 cash buffer 정책도 한 번 같이 들여온다). 시드 당일 참조가 이미
              오늘 봉을 처리했어도 참조의 최종 target(refill 반영)으로 진행하고 그 값을 저장한다
              — 이때 참조 members 를 복원하고(엔진이 stale 기준으로 돌린 refill 되돌리기)
-             drift 는 실잔고 vs 참조 최종 target 으로 다시 계산한다. 시드 실행이 Freshness
-             미달로 끝나면 state 를 저장하지 않는다 (stale 이 굳지 않게, 다음 실행에서 재시드).
+             drift 는 실잔고 vs 참조 최종 target 으로 다시 계산한다 (엔진의 DRIFT_ENABLED
+             스위치를 그대로 따른다). 참조 기록 이후 업비트에서 유의/상폐로 바뀐 코인은
+             target·members 양쪽에서 빼고 그 비중을 현금으로 돌린다 (되살리지 않는다).
+             업비트 상태 조회가 성공했는데 목록에 아예 없는 코인도 상폐로 보고 같이 뺀다
+             (조회 실패 시에는 추론하지 않는다). 이 정화는 시드 실행에서 엔진 호출 전에
+             한 번 수행하므로 새 봉/같은 봉 어느 경로로 가든 적용된다.
+             시드 실행이 정상 계산 경로에 들어서기 전에 중단되면(WAL/미체결/잔고/청산/
+             엔진 오류·Freshness 미달·새 봉 없음) state 를 저장하지 않는다
+             (정화·보정이 끝나지 않은 채 굳지 않게, 다음 실행에서 재시드). 시드가 끝난 뒤에는 참조 파일을
+             아예 읽지 않는다 (참조가 깨져도 live 운영이 멈추지 않게).
     참조의 cash buffer(spot_cash_buffer/cash_buffer/buffer_pct)가 있으면 그대로 빌려 쓴다 —
     target 스케일과 drift 가정 보유비중을 업비트와 같은 기준으로 맞추기 위해서다.
     참조 키는 엄격하게 본다: members 는 엔진 MEMBERS 와 정확히 같아야 하고, 가중치 키는
@@ -2192,6 +2200,52 @@ def _apply_state_ref(state: dict, ref: dict) -> None:
             state[k] = copy.deepcopy(ref[k])
 
 
+def _warned_coins(upbit_status: Optional[Dict[str, Dict]], candidates=()) -> set:
+    """유의/상폐 코인 집합.
+
+    - flag 규칙: 엔진(compute_live_targets)과 동일 — warning=True 이거나 listed=False.
+      (caution 은 상장 리스크가 아니라 제외 안 함)
+    - 부재 규칙: fetch_upbit_market_status 는 현재 KRW 마켓 '전체'를 담으므로(엔진
+      coin_live_engine.fetch_upbit_market_status — KRW- 로 시작하는 모든 마켓), 조회가
+      성공(비어있지 않음)했는데 candidates 중 목록에 없는 코인은 상폐로 본다. 완전 상폐는
+      상태 맵에 아예 나타나지 않아 flag 규칙만으로는 잡히지 않는다.
+      조회 실패(빈 dict)면 상폐와 API 장애를 구분할 수 없으므로 아무것도 추론하지 않는다.
+    """
+    if not isinstance(upbit_status, dict):
+        upbit_status = {}
+    out = set()
+    for coin, info in upbit_status.items():
+        if not isinstance(info, dict):
+            continue
+        if bool(info.get('warning', False)) or not bool(info.get('listed', True)):
+            out.add(coin)
+    if upbit_status:
+        for c in (candidates or ()):
+            if not isinstance(c, str) or _is_cash_key(c) or c.startswith('_'):
+                continue
+            if c not in upbit_status:
+                out.add(c)
+    return out
+
+
+def _purge_warned(w: Dict, warned: set, cash_key: str) -> Dict:
+    """유의/상폐 코인의 비중을 현금 키로 옮긴다 (엔진 purge 와 동일 — 메타키는 그대로 둔다)."""
+    removed = 0.0
+    for k, v in w.items():
+        if k in warned:
+            try:
+                removed += float(v)
+            except (TypeError, ValueError):
+                pass
+    out = {k: v for k, v in w.items() if k not in warned}
+    if removed > 0:
+        try:
+            out[cash_key] = float(out.get(cash_key, 0.0)) + removed
+        except (TypeError, ValueError):
+            out[cash_key] = removed
+    return out
+
+
 def _state_ref_summary(ref: dict) -> str:
     """참조 요약 (로그 1줄용) — members/bar_counter/last_bar/snapshots."""
     ms = ref.get('members') or {}
@@ -2314,7 +2368,11 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
     # 시작 로그 뒤에 둔다 (일일 리포트는 마지막 시작 로그 이후 레코드만 읽는다).
     ref = None
     seeded_now = False       # 이번 실행에서 live 가 참조로 자체 state 를 시드했는가
-    if state_ref is not None:
+    if state_ref is not None and not dry_run and state.get('members'):
+        # 시드가 끝난 live 는 참조 파일의 유효성에 인질이 되면 안 된다 (참조가 깨져도 정상 운영).
+        log('  ⚠ state-ref 무시: 자체 state 에 members 존재 (live 는 최초 1회만 시드) '
+            '— 참조 파일은 읽지 않음')
+    elif state_ref is not None:
         ref_path = ''
         if state_ref.strip() == '':
             ref_err = '참조 경로 비어있음'
@@ -2345,8 +2403,19 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
             prev_combined = _norm_cash_map(state['last_target_snapshot'])
             log(f'📎 state-ref 시드: {ref_name} → 자체 state 초기화 '
                 f'(live 최초 실행, 이후 자체 state 사용)')
-        else:
-            log('  ⚠ state-ref 무시: 자체 state 에 members 존재 (live 는 최초 1회만 시드)')
+
+    seed_ok = False   # 시드 실행이 purge·같은 봉 보정을 끝내고 정상 계산 경로에 들어섰는가
+
+    def _save_state_early(reason: str) -> None:
+        """정상 계산 경로 이전의 중단 저장. 시드 실행이면 저장하지 않는다.
+
+        시드 도중 저장하면 다음 실행부터 'members 있음'을 이유로 참조를 무시해
+        정화/보정이 끝나지 않은 state 가 그대로 굳는다.
+        """
+        if seeded_now and not seed_ok:
+            log(f'  📎 state-ref 시드: {reason} → 시드 state 저장 생략 (다음 실행에서 다시 시드)')
+            return
+        _save_state_unless_dry(state_path, state, dry_run)
 
     session = requests.Session()
     if api is None:
@@ -2361,14 +2430,14 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
             log(f'❌ 미해결 주문 WAL 확인 불가 → fail-closed: {wal_pending}')
             _tg(f'❌ {EXCHANGE_LABEL} 미해결 주문 확인 불가 → 실행 중단. 수동 확인 필요:\n'
                 + '\n'.join(f'  - {d}' for d in wal_pending))
-            _save_state_unless_dry(state_path, state, dry_run)
+            _save_state_early('미해결 주문 WAL 확인 불가')
             _flush_telegram(dry_run)
             return 2
         blocked = api.cancel_all()
         if blocked is None:
             log('❌ 미체결 상태 확인 불가 → fail-closed (리밸런싱 스킵)')
             _tg(f'❌ {EXCHANGE_LABEL} 미체결 조회 실패 → 실행 중단')
-            _save_state_unless_dry(state_path, state, dry_run)
+            _save_state_early('미체결 조회 실패')
             _flush_telegram(dry_run)
             return 2
         blocked_coins = blocked
@@ -2376,13 +2445,68 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
     # 유니버스 필터용 Upbit 상태 (원본과 동일 — 엔진에 그대로 전달)
     upbit_status = cle.fetch_upbit_market_status(session)
 
+    # live 최초 시드 purge — 참조 기록 이후 유의/상폐로 바뀐 코인을 '엔진 호출 전에' 뺀다.
+    # 엔진 자체 purge 는 flag 만 보고(완전 상폐는 상태 맵에서 사라져 안 잡힌다), staggered
+    # 스냅샷은 회전 전까지 옛 코인을 들고 있어서 새 봉 경로에서도 매수로 이어질 수 있다.
+    # ref 는 우리 deep copy 라 제자리에서 정화한다 (참조 파일은 건드리지 않는다).
+    # prev_combined 은 정화 전 원본 target 그대로 둔다 → 제거가 target_changed 로 잡혀 리밸런싱.
+    if seeded_now and ref is not None:
+        _seed_cands = set(ref.get('last_target_snapshot') or {})
+        for _t in (ref.get('last_member_targets') or {}).values():
+            if isinstance(_t, dict):
+                _seed_cands |= set(_t)
+        for _ms in (ref.get('members') or {}).values():
+            if not isinstance(_ms, dict):
+                continue
+            for _sn in (_ms.get('snapshots') or []):
+                if isinstance(_sn, dict):
+                    _seed_cands |= set(_sn)
+            if isinstance(_ms.get('last_combined'), dict):
+                _seed_cands |= set(_ms['last_combined'])
+        _warn = _warned_coins(upbit_status, _seed_cands)
+        if _warn:
+            _hit = set()
+            for _ms in (ref.get('members') or {}).values():
+                if not isinstance(_ms, dict):
+                    continue
+                _snaps = []
+                for _sn in (_ms.get('snapshots') or []):
+                    if isinstance(_sn, dict):
+                        _hit |= (set(_warn) & set(_sn))
+                        _snaps.append(_purge_warned(_sn, _warn, 'CASH'))
+                    else:
+                        _snaps.append(_sn)
+                _ms['snapshots'] = _snaps
+                _lc = _ms.get('last_combined')
+                if isinstance(_lc, dict):
+                    _hit |= (set(_warn) & set(_lc))
+                    _ms['last_combined'] = _purge_warned(_lc, _warn, 'CASH')
+            _lts = ref.get('last_target_snapshot')
+            if isinstance(_lts, dict):
+                _hit |= (set(_warn) & set(_lts))
+                ref['last_target_snapshot'] = _purge_warned(_lts, _warn, 'Cash')
+            _lmt = ref.get('last_member_targets')
+            if isinstance(_lmt, dict):
+                _hit |= {c for t in _lmt.values() if isinstance(t, dict)
+                         for c in (set(_warn) & set(t))}
+                ref['last_member_targets'] = {
+                    m: (_purge_warned(t, _warn, 'Cash') if isinstance(t, dict) else t)
+                    for m, t in _lmt.items()}
+            if _hit:
+                _apply_state_ref(state, ref)     # 정화된 참조로 state 재적용 (다시 deep copy)
+                _hit_flag = sorted(c for c in _hit if c in (upbit_status or {}))
+                _hit_gone = sorted(c for c in _hit if c not in (upbit_status or {}))
+                log(f'  📎 state-ref 시드: 참조 이후 유의/상폐 전환 코인 {sorted(_hit)} → '
+                    f'Cash 로 이동 (warning={_hit_flag}, 목록 부재(상폐)={_hit_gone}, '
+                    f'참조 target/members 에서 제거)')
+
     # 잔고 스냅샷 — 이후 모든 PV/target/delta 계산의 단일 기준 (C2)
     try:
         balance = api.get_balance()
     except BalanceIncomplete as e:
         log(f'❌ 잔고 스냅샷 불완전: {e} → 주문 전 중단')
         _tg(f'❌ {EXCHANGE_LABEL} 잔고 평가 불가 → 실행 중단: {_redact(e)}')
-        _save_state_unless_dry(state_path, state, dry_run)
+        _save_state_early('잔고 스냅샷 불완전')
         _flush_telegram(dry_run)
         return 2
 
@@ -2401,13 +2525,13 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
         except BalanceIncomplete as e:
             log(f'❌ 청산 후 잔고 스냅샷 불완전: {e} → 중단')
             _tg(f'❌ {EXCHANGE_LABEL} 청산 후 잔고 평가 불가 → 실행 중단')
-            _save_state_unless_dry(state_path, state, dry_run)
+            _save_state_early('청산 후 잔고 스냅샷 불완전')
             _flush_telegram(dry_run)
             return 2
         if failed_liq:
             log(f'❌ 청산 실패 {failed_liq} → fail-closed (리밸런싱 스킵)')
             _tg(f'❌ {EXCHANGE_LABEL} 청산 실패 {failed_liq} → 실행 중단')
-            _save_state_unless_dry(state_path, state, dry_run)
+            _save_state_early('청산 실패')
             _flush_telegram(dry_run)
             return 3
 
@@ -2464,7 +2588,7 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
     except Exception as e:
         log(f'❌ 엔진 호출 실패: {_redact(e)}\n{_redact(traceback.format_exc())}')
         _tg(f'❌ 엔진 호출 실패: {_redact(e)}')
-        _save_state_unless_dry(state_path, state, dry_run)
+        _save_state_early('엔진 호출 실패')
         _flush_telegram(dry_run)
         return 2
 
@@ -2487,12 +2611,8 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
         fresh_str = ', '.join(f'{k}={"✓" if v else "✗"}' for k, v in result.fresh.items())
         log(f'  ⚠ Freshness 미달 ({fresh_str}) → 리밸런싱 스킵. 상태만 저장.')
         _tg(f'⚠ Freshness 미달: {fresh_str} → 스킵')
-        if seeded_now:
-            # 이 경로엔 아래 같은 봉 복원이 없다 — 엔진이 써 둔 stale(refill 이전) target 을
-            # 저장하면 다음 실행부터 'members 있음'을 이유로 참조를 무시하고 그대로 굳는다
-            log('  📎 state-ref 시드: Freshness 미달 → 시드 state 저장 생략 (다음 실행에서 다시 시드)')
-        else:
-            _save_state_unless_dry(state_path, state, dry_run)
+        # 이 경로엔 같은 봉 복원이 없다 — 엔진이 써 둔 stale(refill 이전) target 이 굳지 않게
+        _save_state_early('Freshness 미달')
         _flush_telegram(dry_run)
         return 1
 
@@ -2506,7 +2626,7 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
     _cap_defend_fire = (_spot_cap_ratio is not None and _spot_cap_ratio < (1.0 - CAP_DEFEND_MIN_EXCESS))
     if not result.any_new_bar and not _cap_defend_fire and not _same_bar_ref:
         log('  ℹ 새 봉 없음 (idempotent) → 리밸런싱 스킵.')
-        _save_state_unless_dry(state_path, state, dry_run)
+        _save_state_early('새 봉 없음')
         _tg(f'⏸ 새 봉 없음 → 스킵 (다음 봉 닫힘 대기)')
         _flush_telegram(dry_run)
         return 0
@@ -2519,8 +2639,12 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
         # 업비트가 실제로 쓴 최종 target 은 참조본의 last_target_snapshot / last_member_targets 이므로
         # 그 값으로 맞춘다.
         _ref_final = {k: v for k, v in ref['last_target_snapshot'].items() if k != '_ts'}
-        result.combined_target = _norm_cash_map(_ref_final)
         _ref_mt = ref.get('last_member_targets') or {}
+        _ref_members = None
+        if not dry_run:
+            # 유의/상폐 purge 는 시드 직후(엔진 호출 전)에 ref 에 이미 반영돼 있다
+            _ref_members = copy.deepcopy(ref['members'])
+        result.combined_target = _norm_cash_map(_ref_final)
         if _ref_mt:   # 없으면 엔진의 같은 봉 멤버 target 을 그대로 둔다 (멤버 줄이 사라지지 않게)
             result.member_targets = {m: _norm_cash_map({k: v for k, v in t.items() if k != '_ts'})
                                      for m, t in _ref_mt.items()}
@@ -2538,12 +2662,15 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
             # 저장한다 — 시드 당일 자체 state 에 굳으면 다음 실행까지 stale 로 주문하게 된다.
             # 엔진은 stale 기준으로 drift 를 평가했고 refill v2 가 members 스냅샷까지 바꿨을 수
             # 있으므로, 참조 members 를 되돌리고 drift 는 실잔고 vs 참조 최종 target 으로 다시 잡는다.
-            state['members'] = copy.deepcopy(ref['members'])
+            state['members'] = _ref_members
             state['last_target_snapshot'] = {**_ref_final, '_ts': cle.to_utc_iso(now)}
             if _ref_mt:
                 state['last_member_targets'] = {
                     m: {**{k: v for k, v in t.items() if k != '_ts'}, '_ts': cle.to_utc_iso(now)}
                     for m, t in _ref_mt.items()}
+            else:
+                # 엔진이 써 둔 stale(refill 이전) 멤버 target 을 저장하지 않는다 (다음 실행이 다시 쓴다)
+                state.pop('last_member_targets', None)
             try:
                 _seed_buf = float(state.get('spot_cash_buffer',
                                             state.get('cash_buffer',
@@ -2553,12 +2680,17 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
             _ht_ref = (cle.half_turnover(cur_w_input, apply_cash_buffer(_ref_final, _seed_buf))
                        if cur_w_input else 0.0)
             try:
-                result.drift_fire = _ht_ref >= result.drift_threshold
+                # 엔진의 snap-only 스위치(DRIFT_ENABLED=False)를 여기서 우회하면 안 된다
+                result.drift_fire = bool(cle.DRIFT_ENABLED) and _ht_ref >= result.drift_threshold
                 result.drift_half_turnover = _ht_ref
             except Exception:
                 pass
             log('  📎 state-ref 시드: 참조가 이미 오늘 봉을 처리함 → 참조의 최종 target 으로 진행 '
-                f'(drift 는 실잔고 vs 참조 최종 target 재계산: ht={_ht_ref:.4f})')
+                f'(drift 는 실잔고 vs 참조 최종 target 재계산: ht={_ht_ref:.4f}, '
+                f'drift_enabled={cle.DRIFT_ENABLED})')
+
+    # 여기부터는 정상 계산 경로 — 시드 실행도 이후 저장은 그대로 수행한다
+    seed_ok = True
 
     # 멤버/합산 target 로깅
     for mname, mt in result.member_targets.items():
@@ -2600,9 +2732,11 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
         _spot_buf = float(state.get('spot_cash_buffer', state.get('cash_buffer', CASH_BUFFER_DEFAULT)))
     except (TypeError, ValueError):
         _spot_buf = CASH_BUFFER_DEFAULT
-    # state-ref dry-run 은 보유비중 가정에 이미 buffer 가 반영돼 있고, 이 블록의 변환은
-    # target 에 Cash 가 이미 있는 경우 apply_cash_buffer 와 달라 혼자 재발화할 수 있다 → 건너뛴다
-    if _spot_buf > 0 and cur_w_input and not (dry_run and ref is not None):
+    # 참조 경로에서는 건너뛴다 — 이 블록의 변환은 target 에 Cash 가 이미 있으면
+    # apply_cash_buffer 와 달라 임계 근처에서 혼자 재발화한다.
+    #  · dry-run: 가정 보유비중에 이미 buffer 가 반영돼 있다.
+    #  · live 시드 같은 봉: _ht_ref 를 이미 apply_cash_buffer(참조 최종 target) 기준으로 다시 잡았다.
+    if _spot_buf > 0 and cur_w_input and not (ref is not None and (dry_run or _same_bar_ref)):
         _combined_buf = {}
         _has_cash_in_tgt = any(str(_k).lower() == 'cash' for _k in result.combined_target)
         # canary OFF (Cash=1.0) 인 경우 buffer 적용 skip — 이미 Cash 100%
@@ -2617,7 +2751,9 @@ def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -
             if not _has_cash_in_tgt:
                 _combined_buf['Cash'] = _spot_buf
             _ht_buf = cle.half_turnover(cur_w_input, _combined_buf)
-            if _ht_buf >= result.drift_threshold and not result.drift_fire:
+            # DRIFT_ENABLED=False 면 엔진이 drift 를 강제로 끈 상태다 — 여기서 되살리면 안 된다
+            if (bool(cle.DRIFT_ENABLED) and _ht_buf >= result.drift_threshold
+                    and not result.drift_fire):
                 log(f'  🔔 cash buffer 반영 drift 재평가: ht={_ht_buf:.4f} ≥ {result.drift_threshold:.2f} → fire')
                 # 엔진 결과 override (dataclass — 일부는 frozen 일 수 있어 try/except)
                 try:
