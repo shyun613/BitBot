@@ -236,6 +236,11 @@ RE_COMBINED_TGT = re.compile(r'^\s*combined target: (.*?) \(cash=([\d.]+)%\)\s*$
 # 'combined target:' 라인과 겹치지 않도록 member 이름에서 combined 제외
 RE_MEMBER_TGT = re.compile(r'^\s*(?!combined\b)(\S+) target: (.*?) \(cash=([\d.]+)%\)\s*$')
 RE_TOKEN = re.compile(r'([A-Z0-9]+):([\d.]+)%')
+# '📎 state-ref: trade_state.json 참조 (…)' / '📎 state-ref 시드: trade_state.json → …'
+# 줄머리의 📎 까지 앵커한다 — 들여쓴 후속 정보줄('  📎 state-ref: drift 평가 …')이 파일명을
+# 덮어쓰지 못하게. (참조 실패 'state-ref 참조 실패: …' 도 매칭되지 않는다 — 결과 마커가 잡는다)
+# 파일명 뒤의 '참조'/'→' 를 경계로 삼아 공백이 든 파일명도 통째로 잡는다.
+RE_STATE_REF = re.compile(r'^📎 state-ref(?: 시드)?: (.+?) (?:참조|→)')
 
 SEVERITY = {'ok': 0, 'skip': 1, 'warn': 2, 'error': 3}
 PAIR_MAX_GAP_SEC = 30 * 60  # 두 실행 시작 시각 차가 이보다 크면 동일 사이클 쌍으로 보기 어려움
@@ -277,6 +282,9 @@ RESULT_MARKERS: List[Tuple[str, str, str]] = [
     ('WAL 읽기 실패', 'error', 'WAL 읽기 실패'),
     ('reconcile 실패', 'error', 'WAL reconcile 실패'),
     ('미체결 상태 확인 불가', 'error', '미체결 상태 확인 불가'),
+    # 'state-ref 참조 실패: 참조 state JSON 손상 …' 처럼 두 마커를 모두 담는 줄이 있으므로
+    # 더 구체적인 state-ref 를 먼저 둔다 (동일 severity 는 먼저 매칭된 라벨이 남는다)
+    ('state-ref 참조 실패', 'error', 'state-ref 참조 실패 (fail-closed)'),
     ('state 손상', 'error', 'state 파일 손상'),
     ('permanent_block', 'warn', 'permanent_block 등록'),
     ('청산 검증', 'ok', '거래정지 청산'),
@@ -405,6 +413,7 @@ class SideResult:
         self.start_count = 0                   # 그 날 실행 시작 횟수
         self.abort_hints: List[str] = []       # 시작 로그 없이 끝난 원인 후보
         self.cycle_id: Optional[str] = None    # 래퍼가 주입한 사이클 ID (있는 쪽만)
+        self.state_ref: Optional[str] = None   # 참조한 state 파일명 (--state-ref 사용 시)
 
     # ─── 파싱 ───
     def parse(self, day: str):
@@ -457,6 +466,10 @@ class SideResult:
             m = RE_MEMBER_TGT.match(first)
             if m:
                 self.members[m.group(1)] = _parse_weights(m.group(2), m.group(3))
+                continue
+            m = RE_STATE_REF.match(first)
+            if m:
+                self.state_ref = m.group(1)
                 continue
 
         # 카나리 알림은 flip 때만 찍히므로, 없으면 멤버 타겟에서 추론
@@ -1251,7 +1264,10 @@ def _spot_canary_visible(sides: List[SideResult]) -> bool:
 
 def _mode_word(s: SideResult) -> str:
     """비교 섹션의 실행 모드 표기 — 판정이 아니라 정보 표시용."""
-    return '?' if s.dry_run is None else ('dry-run' if s.dry_run else 'LIVE')
+    if s.dry_run is None:
+        return '?'
+    word = 'dry-run' if s.dry_run else 'LIVE'
+    return f'{word}(state-ref)' if s.state_ref else word
 
 
 def _upbit_value_line(uv: Dict[str, object]) -> Tuple[str, bool]:
@@ -1331,6 +1347,8 @@ def build_report(day: str, sides: List[SideResult],
 
     for s in sides:
         mode = '?' if s.dry_run is None else ('dry' if s.dry_run else 'LIVE')
+        if s.state_ref:
+            mode += '(state-ref)'
         if not s.ran:
             warn = True
             reason = '; '.join(s.problems) or '실행 기록 없음'
@@ -1409,6 +1427,13 @@ def build_report(day: str, sides: List[SideResult],
         lines.append(f'실행 모드: 양쪽 {_mode_word(a)}')
     else:
         lines.append(f'실행 모드: {a.name}={_mode_word(a)}, {b.name}={_mode_word(b)}')
+
+    # 0-3) state-ref — 한쪽이 상대 state 를 참조하면 두 target 은 독립 신호가 아니다.
+    #      경고는 아니지만(정상 운영 조합) 비교의 의미가 달라지므로 정보로 남긴다.
+    for s in sides:
+        if s.state_ref:
+            lines.append(f'ℹ {s.name} 는 {s.state_ref} 를 state-ref 로 참조 → '
+                         f'타겟 일치는 파이프라인 검증이며 신호 독립 비교가 아님')
 
     # 1) 카나리 — 멤버 키가 같으면 멤버별, 다르면 (추론 경로 차이) 종합 ON/OFF 로 비교
     if not a.canary or not b.canary:

@@ -1490,6 +1490,92 @@ def test_now_kst_is_always_tz_aware(tmp_path):
     assert parsed is not None and parsed.utcoffset() == cdr.KST_FIXED.utcoffset(None)
 
 
+# ──────────────────── state-ref (현물 dry-run 이 업비트 state 를 참조) ────────────────────
+SPOT_STATE_REF = ("📎 state-ref: trade_state.json 참조 (dry-run, schema=V24, "
+                  "members=['D_SMA42'], bar_counter=1234, "
+                  "last_bar=2026-08-30T00:00:00Z, snapshots=7)")
+SPOT_STATE_REF_FAIL = ('🚨 state-ref 참조 실패: 참조 파일 없음: trade_state.json '
+                       '→ fail-closed (fresh 초기화로 대체하지 않음)')
+# 참조 줄 뒤에 오는 들여쓴 정보줄 — 파일명을 덮어쓰면 안 된다 (실물 로그 순서 그대로)
+SPOT_STATE_REF_DRIFT = '  📎 state-ref: drift 평가 보유비중 = 참조 last_target_snapshot 가정 (실잔고 아님)'
+
+
+def _spot_sides_with(tmp_path, extra_bn=(), dry=(True, True)):
+    """바낸현물 쪽에만 로그 줄을 더한 현물 2축 (그 외는 _spot_sides 와 동일한 블록)."""
+    sides = []
+    for (name, fname), dry_run in zip(SPOT_SIDES, dry):
+        body = SPOT_LOG.format(day=DAY, rid='0005abcd', canary='',
+                               tgt='BTC:33.3%, ETH:33.3%', cash='33.4', dry=dry_run)
+        if name == '바낸현물' and extra_bn:
+            head, rest = body.split('\n', 1)
+            extra = ''.join(f'[{DAY} 00:05:10] [0005abcd] {m}\n' for m in extra_bn)
+            body = head + '\n' + extra + rest
+        s = cdr.SideResult(name, _write(tmp_path, body, fname))
+        s.parse(DAY)
+        sides.append(s)
+    return sides
+
+
+def test_spot_state_ref_line_is_parsed_and_shown(tmp_path):
+    """참조 파일명을 읽어 모드 표기·안내줄에 싣는다 (경고는 아니다)."""
+    sides = _spot_sides_with(tmp_path, extra_bn=[SPOT_STATE_REF, SPOT_STATE_REF_DRIFT],
+                             dry=(False, True))
+    assert sides[1].state_ref == 'trade_state.json', sides[1].state_ref
+    assert sides[0].state_ref is None
+    body, warn = cdr.build_report(DAY, sides)
+
+    assert '[바낸현물] 00:05:10 (dry(state-ref))' in body, body
+    assert '실행 모드: 업비트=LIVE, 바낸현물=dry-run(state-ref)' in body, body
+    assert ('ℹ 바낸현물 는 trade_state.json 를 state-ref 로 참조 → '
+            '타겟 일치는 파이프라인 검증이며 신호 독립 비교가 아님') in body, body
+    # 같은 블록에서 state-ref 줄만 뺀 경우와 warn 판정이 같아야 한다 (정보 표시일 뿐)
+    _, base_warn = cdr.build_report(DAY, _spot_sides_with(tmp_path, dry=(False, True)))
+    assert warn == base_warn, (warn, base_warn)
+
+
+def test_spot_state_ref_failure_is_error(tmp_path):
+    """참조 실패는 fail-closed 종료 — '거래 완료' 마커가 있어도 error 로 남는다."""
+    sides = _spot_sides_with(tmp_path, extra_bn=[SPOT_STATE_REF_FAIL])
+    s = sides[1]
+    assert s.result_kind == 'error', (s.result_kind, s.result_label)
+    assert 'state-ref' in s.result_label, s.result_label
+    assert s.state_ref is None, s.state_ref      # 실패 라인을 참조 파일명으로 오인하지 않는다
+    body, warn = cdr.build_report(DAY, sides)
+    assert warn is True
+    assert 'state-ref 참조 실패' in body, body
+
+
+def test_spot_state_ref_filename_with_space_is_captured(tmp_path):
+    """파일명에 공백이 있어도 통째로 잡는다 (뒤따르는 '참조'/'→' 까지가 경계)."""
+    line = ("📎 state-ref: my trade state.json 참조 (dry-run, schema=V24, "
+            "members=['D_SMA42'], bar_counter=1234, last_bar=2026-08-30T00:00:00Z, snapshots=7)")
+    sides = _spot_sides_with(tmp_path, extra_bn=[line, SPOT_STATE_REF_DRIFT])
+    assert sides[1].state_ref == 'my trade state.json', sides[1].state_ref
+    body, _warn = cdr.build_report(DAY, sides)
+    assert 'ℹ 바낸현물 는 my trade state.json 를 state-ref 로 참조' in body, body
+
+
+def test_spot_state_ref_failure_reason_keeps_state_ref_label(tmp_path):
+    """실패 사유가 'state … 손상' 을 담아도 라벨은 state-ref 쪽이 남는다 (마커 우선순위)."""
+    for reason in ('참조 state JSON 손상: Expecting value', '참조 state 손상 의심'):
+        sides = _spot_sides_with(
+            tmp_path, extra_bn=[f'🚨 state-ref 참조 실패: {reason} → fail-closed'])
+        s = sides[1]
+        assert s.result_kind == 'error', (reason, s.result_kind)
+        assert s.result_label == 'state-ref 참조 실패 (fail-closed)', (reason, s.result_label)
+
+
+def test_spot_report_without_state_ref_is_unchanged(tmp_path):
+    """state-ref 줄이 없으면 출력은 종전과 완전히 같다."""
+    sides = _spot_sides(tmp_path)
+    assert all(s.state_ref is None for s in sides)
+    body, warn = cdr.build_report(DAY, sides)
+    assert 'state-ref' not in body and 'ℹ' not in body, body
+    assert '[바낸현물] 00:05:10 (dry)' in body, body
+    assert '실행 모드: 양쪽 dry-run' in body, body
+    assert warn is False
+
+
 # ─── pytest 없는 환경(오라클 .venv)용 최소 러너 — pytest 스타일은 그대로 ───
 if __name__ == '__main__':  # pragma: no cover
     import tempfile

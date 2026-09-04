@@ -45,6 +45,38 @@ dry-run 규약 (억제 범위 명시):
   억제하지 않는 것 = 로그 파일 기록, flock 파일 생성/truncate, 엔진의 universe/exchangeInfo
   디스크 캐시 갱신, 읽기 전용 계좌·시세 조회. (원본 executor_coin.py 와 동일한 규약)
 
+  --state-ref PATH (엔진 상태 참조):
+    dry-run 은 state 를 저장하지 않아 매 실행 7개 스냅샷을 새로 초기화한다 → 업비트 LIVE 와
+    같은 날 다른 target 이 나올 수 있다. 그래서 업비트 실행기의 V24 state 파일을 **읽기 전용**
+    출처로 참조해 같은 스냅샷에서 출발한다 (참조 파일은 어떤 경로에서도 절대 쓰지 않는다).
+    dry-run: 매 실행 참조(members/last_target_snapshot/schema_version/last_member_targets 덮어쓰기),
+             자체 state 저장은 종전대로 생략. drift 평가 보유비중은 참조 목표를 보유 중이라
+             가정한다 (dust 계좌의 실잔고로 평가하면 매일 drift 발화 → refill v2 가 업비트와
+             다른 코인으로 교체됨). 참조가 이미 오늘 봉을 처리했으면(같은 봉) '새 봉 없음'
+             스킵을 하지 않고 참조의 최종 target(refill v2 반영)으로 비교를 진행한다.
+    live:    자체 state 에 members 가 없을 때만 1회 시드, 이후에는 자체 state 만 사용
+             (시드 때 참조의 cash buffer 정책도 한 번 같이 들여온다). 시드 당일 참조가 이미
+             오늘 봉을 처리했어도 참조의 최종 target(refill 반영)으로 진행하고 그 값을 저장한다
+             — 이때 참조 members 를 복원하고(엔진이 stale 기준으로 돌린 refill 되돌리기)
+             drift 는 실잔고 vs 참조 최종 target 으로 다시 계산한다. 시드 실행이 Freshness
+             미달로 끝나면 state 를 저장하지 않는다 (stale 이 굳지 않게, 다음 실행에서 재시드).
+    참조의 cash buffer(spot_cash_buffer/cash_buffer/buffer_pct)가 있으면 그대로 빌려 쓴다 —
+    target 스케일과 drift 가정 보유비중을 업비트와 같은 기준으로 맞추기 위해서다.
+    참조 키는 엄격하게 본다: members 는 엔진 MEMBERS 와 정확히 같아야 하고, 가중치 키는
+    대문자 티커(또는 현금 키)만 허용한다 (메타키·소문자 키는 거부).
+    참조 실패(파일 부재/JSON 손상/스키마 불일치/가중치 이상 등)는 fail-closed — fresh 초기화로
+    대체하지 않고 exit 2 로 중단한다. 참조 경로는 .json 파일만 허용하며, 이 실행기가 쓰는
+    파일(자체 state/로그/락/캐시)과 같은 파일(심볼릭·하드링크 포함)이면 거부한다.
+    한계: ① 새 봉 경로의 refill v2 는 '참조 목표 보유' 가정 drift 로 평가하므로, 업비트가
+          실잔고 drift 로 그날 refill 을 발화하면 shadow 는 refill 이전 target 을 낼 수 있다
+          (그날 리포트에 불일치로 드러나고 다음 날 정합). ② live 시드 당일 업비트가 이미 오늘
+          봉을 처리했으면 참조의 최종 target 을 쓰고 저장하므로 stale 은 남지 않는다. 다만
+          시드 직후 첫 리밸런싱은 실잔고 drift 로 한 번에 목표까지 채우려 하므로 체결 여력을
+          확인할 것.
+          ③ universe_cache 는 참조하지 않고 dry-run 에선 자체 캐시도 버린다 (TTL 20h 라
+          양쪽이 같은 분 안에 같은 소스로 재구성하고, 같은 봉 경로는 참조 최종 target 으로
+          덮으므로 결과에 영향 없음).
+
 exit 코드 계약 (원본 executor_coin.py parity — 의도적으로 동일하게 유지):
   0 = 정상 종료 / 정상 스킵(새 봉 없음·target 불변·목표 근접) / health lock 활성 / flock 충돌
   1 = freshness 미달 스킵
@@ -60,6 +92,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import logging
 import math
@@ -1946,6 +1979,232 @@ def load_state_strict(state_path: str) -> Tuple[Optional[dict], str]:
     return obj, ''
 
 
+# 참조로 지정하면 안 되는 경로 — 이 실행기(또는 엔진)가 쓰기 대상으로 삼는 파일들
+STATE_REF_DENY_FILES = ('universe_cg_cache.json', 'binance_exchinfo_cache.json',
+                        'binance_exchange_info_cache.json', 'binance_universe_cache.json')
+
+
+def _state_ref_path_error(ref_path: str, state_path: str) -> str:
+    """참조 경로가 이 실행기의 쓰기 대상과 겹치면 사유, 아니면 ''.
+
+    읽기 전용 참조라 해도 쓰기 파일을 가리키면 (실수든 오설정이든) 참조와 저장이 같은
+    파일을 물어 상태가 서로를 덮어쓸 수 있으므로 아예 막는다. 심볼릭 링크는 realpath,
+    하드링크는 samefile 로 본다.
+    """
+    base = os.path.basename(ref_path)
+    if base.endswith('.tmp'):
+        return '임시 파일 경로는 참조 불가'
+    if not base.endswith('.json'):
+        return '참조는 .json state 파일만 허용'
+    rp = os.path.realpath(ref_path)
+    deny = [state_path, state_path + '.tmp', LOG_PATH, LOCK_FILE]
+    deny += [os.path.join(CACHE_DIR, n) for n in STATE_REF_DENY_FILES]
+    try:   # HealthGuard 생성자는 읽기만 한다. 실패해도 preflight 자체는 계속.
+        _hg = HealthGuard(name='coin_binance')
+        deny += [_hg.health_file, _hg.health_file + '.tmp', _hg.lock_file, _hg.abort_log]
+    except Exception:
+        pass
+    for d in deny:
+        if rp == os.path.realpath(d):
+            return f'쓰기 대상 경로와 충돌: {base}'
+        try:
+            if os.path.exists(d) and os.path.samefile(ref_path, d):
+                return f'쓰기 대상 경로와 충돌: {base}'
+        except OSError:
+            pass
+    return ''
+
+
+STATE_REF_SUM_TOL = 0.01   # 참조 가중치 맵 합 허용 오차 (1.0 ± tol)
+# 가중치 키로 허용하는 형태 — 대문자 티커. 그 외(메타키/소문자/빈 문자열)는 거부한다
+# (현금 키 'Cash'/'cash' 는 _is_cash_key 로 따로 허용).
+_STATE_REF_KEY_RE = re.compile(r'^[A-Z0-9]{1,20}$')
+# 참조에서 빌려오는 cash buffer 정책 키 (업비트와 같은 buffer 로 맞춰야 target·drift 가 일치)
+STATE_REF_BUFFER_KEYS = ('spot_cash_buffer', 'cash_buffer', 'buffer_pct')
+
+
+def _state_ref_weight_error(w: Dict, label: str, allow_ts: bool = False) -> str:
+    """참조 가중치 맵 검증.
+
+    - 멤버 맵(snapshots[i] / last_combined)은 엔진이 '모든 키'에 산술을 하므로 '_ts' 같은
+      메타키조차 허용하지 않는다 (allow_ts=False). 통과시키면 엔진 안에서 터진다 —
+      즉 fail-closed 지점을 이미 지난 뒤라 막을 수 없다.
+    - 상위 target 맵(last_target_snapshot / last_member_targets[m])만 '_ts' 를 선택 허용하되
+      파싱 가능한 문자열이어야 한다.
+    - 값은 bool 아닌 유한 실수 ≥ 0, 합은 1.0 ± STATE_REF_SUM_TOL (빈 맵·전부 0·합 2.0 거부).
+      같은 봉 경로가 last_target_snapshot 을 정규화 없이 그대로 쓰므로 합까지 본다.
+    """
+    total = 0.0
+    n_w = 0
+    for k, v in w.items():
+        if not isinstance(k, str):
+            return f'참조 {label} 키 타입 이상: {k!r}'
+        if k == '_ts':
+            if not allow_ts:
+                return f'참조 {label} 에 메타키 _ts 포함 (엔진이 가중치로 계산함)'
+            if not isinstance(v, str) or cle.parse_utc_iso(v) is None:
+                return f'참조 {label}._ts 이상: {v!r}'
+            continue
+        if not (_is_cash_key(k) or _STATE_REF_KEY_RE.match(k)):
+            return f'참조 {label} 키 형식 이상: {k!r}'
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return f'참조 {label}[{k}] 값 타입 이상: {v!r}'
+        try:
+            fv = float(v)
+            ok = math.isfinite(fv)
+        except (OverflowError, TypeError, ValueError):
+            return f'참조 {label}[{k}] 값 변환 실패: {v!r}'
+        if not ok or fv < 0:
+            return f'참조 {label}[{k}] 값 이상: {v!r}'
+        total += fv
+        n_w += 1
+    if n_w == 0 or abs(total - 1.0) > STATE_REF_SUM_TOL:
+        return f'참조 {label} 가중치 합 이상: {total:.6f} (기대 1.0 ± {STATE_REF_SUM_TOL})'
+    return ''
+
+
+def load_state_ref(path: str) -> Tuple[Optional[dict], str]:
+    """다른 실행기(업비트 LIVE)의 V24 state 를 **읽기 전용** 참조로 로드한다.
+
+    Returns: (엔진 상태 사본, '') 또는 (None, 실패사유). 실패는 첫 문제에서 즉시 반환하고
+    호출자가 fail-closed 한다 (fresh 초기화로 대체하면 신호가 갈리므로).
+    참조 파일은 열기만 하며 어떤 경우에도 쓰지 않는다. 반환값은 deep copy 라
+    호출자가 mutate 해도 원본 dict/파일에 영향이 없다.
+    """
+    if not os.path.exists(path):
+        return None, f'참조 파일 없음: {os.path.basename(path)}'
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+    except json.JSONDecodeError as e:
+        return None, f'참조 state JSON 손상: {e}'
+    except Exception as e:
+        return None, f'참조 state 읽기 실패: {_redact(e)}'
+
+    # 검증 전체를 감싼다 — 참조 파일은 이 프로세스가 만들지 않은 입력이라
+    # 예상 못 한 형태로도 올 수 있다. 어떤 예외든 fresh 초기화가 아니라 fail-closed 로.
+    try:
+        if not isinstance(obj, dict):
+            return None, f'참조 state 최상위 타입 이상: {type(obj).__name__}'
+
+        sv = obj.get('schema_version')
+        if sv != cle.SCHEMA_VERSION:
+            return None, f'참조 schema_version 불일치: {sv!r} != {cle.SCHEMA_VERSION}'
+
+        members = obj.get('members')
+        if not isinstance(members, dict):
+            return None, f'참조 members 타입 이상: {type(members).__name__}'
+        unknown_m = sorted(set(members) - set(cle.MEMBERS))
+        if unknown_m:
+            return None, f'참조 members 에 미지 멤버: {unknown_m}'
+        for mname, mcfg in cle.MEMBERS.items():
+            ms = members.get(mname)
+            if not isinstance(ms, dict):
+                return None, f'참조 멤버 없음/타입 이상: {mname}'
+            n_snap = mcfg['n_snapshots']
+            snaps = ms.get('snapshots')
+            if not isinstance(snaps, list) or len(snaps) != n_snap:
+                got = len(snaps) if isinstance(snaps, list) else type(snaps).__name__
+                return None, f'참조 {mname} snapshots 이상: {got} != {n_snap}'
+            for si, snap_i in enumerate(snaps):
+                if not isinstance(snap_i, dict):
+                    return None, f'참조 {mname} snapshot 항목 타입 이상'
+                werr = _state_ref_weight_error(snap_i, f'{mname} snapshots[{si}]')
+                if werr:
+                    return None, werr
+            bc = ms.get('bar_counter')
+            if isinstance(bc, bool) or not isinstance(bc, int) or bc < 0:
+                return None, f'참조 {mname} bar_counter 이상: {bc!r}'
+            lbt = ms.get('last_bar_ts')
+            if not isinstance(lbt, str) or not lbt or cle.parse_utc_iso(lbt) is None:
+                return None, f'참조 {mname} last_bar_ts 이상: {lbt!r}'
+            if not isinstance(ms.get('canary_on'), bool):
+                return None, f'참조 {mname} canary_on 타입 이상: {type(ms.get("canary_on")).__name__}'
+            if not isinstance(ms.get('last_combined'), dict):
+                return None, f'참조 {mname} last_combined 타입 이상: {type(ms.get("last_combined")).__name__}'
+            werr = _state_ref_weight_error(ms['last_combined'], f'{mname} last_combined')
+            if werr:
+                return None, werr
+            if 'snap_id' in ms:
+                sid = ms['snap_id']
+                if isinstance(sid, bool) or not isinstance(sid, int) or sid < 0:
+                    return None, f'참조 {mname} snap_id 이상: {sid!r}'
+
+        snap = obj.get('last_target_snapshot')
+        if not isinstance(snap, dict):
+            return None, f'참조 last_target_snapshot 타입 이상: {type(snap).__name__}'
+        if not {k: v for k, v in snap.items() if k != '_ts'}:
+            return None, '참조 last_target_snapshot 비어있음'
+        werr = _state_ref_weight_error(snap, 'last_target_snapshot', allow_ts=True)
+        if werr:
+            return None, werr
+
+        if 'last_member_targets' in obj:
+            lmt = obj['last_member_targets']
+            if not isinstance(lmt, dict):
+                return None, f'참조 last_member_targets 타입 이상: {type(lmt).__name__}'
+            unknown_mt = sorted(set(lmt) - set(cle.MEMBERS))
+            if unknown_mt:
+                return None, f'참조 last_member_targets 에 미지 멤버: {unknown_mt}'
+            for mn, mt in lmt.items():
+                if not isinstance(mt, dict):
+                    return None, f'참조 last_member_targets[{mn}] 타입 이상: {type(mt).__name__}'
+                werr = _state_ref_weight_error(mt, f'last_member_targets[{mn}]', allow_ts=True)
+                if werr:
+                    return None, werr
+
+        for bk in STATE_REF_BUFFER_KEYS:
+            if bk not in obj:
+                continue
+            bv = obj[bk]
+            if isinstance(bv, bool) or not isinstance(bv, (int, float)):
+                return None, f'참조 {bk} 타입 이상: {bv!r}'
+            try:
+                fbv = float(bv)
+                ok_b = math.isfinite(fbv)
+            except (OverflowError, TypeError, ValueError):
+                return None, f'참조 {bk} 값 변환 실패: {bv!r}'
+            if not ok_b or not (0.0 <= fbv < 0.5):
+                return None, f'참조 {bk} 범위 이상: {bv!r} (0 ≤ v < 0.5)'
+
+        out = {
+            'members': copy.deepcopy(members),
+            'last_target_snapshot': copy.deepcopy(snap),
+            'schema_version': sv,
+        }
+        if 'last_member_targets' in obj:
+            out['last_member_targets'] = copy.deepcopy(obj['last_member_targets'])
+        for bk in STATE_REF_BUFFER_KEYS:
+            if bk in obj:
+                out[bk] = obj[bk]
+        return out, ''
+    except Exception as e:
+        return None, f'참조 검증 중 예외: {_redact(e)}'
+
+
+def _apply_state_ref(state: dict, ref: dict) -> None:
+    """참조본의 엔진 상태 키만 현재 state 로 옮긴다 (참조 파일은 건드리지 않는다)."""
+    for k in (('members', 'last_target_snapshot', 'schema_version', 'last_member_targets')
+              + STATE_REF_BUFFER_KEYS):
+        if k in ref:
+            # 엔진이 state 를 mutate 해도 참조 사본이 따라 변하지 않도록 값마다 deep copy
+            # (같은 봉 경로는 엔진 실행 뒤에 ref[...] 를 다시 읽는다)
+            state[k] = copy.deepcopy(ref[k])
+
+
+def _state_ref_summary(ref: dict) -> str:
+    """참조 요약 (로그 1줄용) — members/bar_counter/last_bar/snapshots."""
+    ms = ref.get('members') or {}
+    names = sorted(ms)
+
+    def _f(key):
+        return ','.join(str((ms.get(n) or {}).get(key)) for n in names)
+
+    snaps = ','.join(str(len((ms.get(n) or {}).get('snapshots') or [])) for n in names)
+    return (f'schema={ref.get("schema_version")}, members={names}, '
+            f'bar_counter={_f("bar_counter")}, last_bar={_f("last_bar_ts")}, snapshots={snaps}')
+
+
 def _save_state_unless_dry(state_path: str, state: dict, dry_run: bool) -> None:
     """dry-run이면 state 저장을 건너뛰어 실거래 트리거가 오염되지 않게 한다."""
     if dry_run:
@@ -2022,11 +2281,14 @@ def format_delta_preview(target: Dict[str, float], balance: Dict[str, float],
 
 
 # ═══ run_once ═══
-def run_once(dry_run: bool = False, api=None) -> int:
+def run_once(dry_run: bool = False, api=None, state_ref: Optional[str] = None) -> int:
     """한 사이클 실행. 리턴: 0=정상, 1=freshness 스킵, 2=에러, 3=청산 실패 fail-closed.
 
     (원본 executor_coin.py 와 동일한 반환 계약 — 파일 헤더 exit 계약 참조)
     api: 테스트용 주입. None 이면 실제 BinanceSpotAPI 생성.
+    state_ref: 다른 실행기(업비트 LIVE)의 V24 state 파일 경로. 읽기 전용 참조이며
+        상대경로는 CACHE_DIR 기준 (STATE_FILE 과 동일 규약). dry-run 은 매 실행 참조,
+        live 는 자체 state 에 members 가 없을 때 1회 시드. 참조 실패는 fail-closed (exit 2).
     """
     state_path = os.path.join(CACHE_DIR, STATE_FILE)
     state, state_err = load_state_strict(state_path)
@@ -2047,6 +2309,44 @@ def run_once(dry_run: bool = False, api=None) -> int:
     prev_combined = _norm_cash_map(_prev_snap)
 
     log(f'═══ {EXCHANGE_LABEL} Executor 시작 (dry_run={dry_run}, now={cle.to_utc_iso(now)}) ═══')
+
+    # state-ref — 업비트 LIVE 의 V24 state 를 엔진 상태 출처로 참조 (읽기 전용).
+    # 시작 로그 뒤에 둔다 (일일 리포트는 마지막 시작 로그 이후 레코드만 읽는다).
+    ref = None
+    seeded_now = False       # 이번 실행에서 live 가 참조로 자체 state 를 시드했는가
+    if state_ref is not None:
+        ref_path = ''
+        if state_ref.strip() == '':
+            ref_err = '참조 경로 비어있음'
+        else:
+            ref_path = state_ref if os.path.isabs(state_ref) else os.path.join(CACHE_DIR, state_ref)
+            ref_err = _state_ref_path_error(ref_path, state_path)
+            if not ref_err:
+                ref, ref_err = load_state_ref(ref_path)
+        if ref_err:
+            log(f'🚨 state-ref 참조 실패: {ref_err} → fail-closed (fresh 초기화로 대체하지 않음)')
+            # 사유에 참조 파일 값이 섞일 수 있다 — 파일 로그 필터는 텔레그램을 안 덮는다
+            _tg(f'🚨 {EXCHANGE_LABEL} state-ref 참조 실패 → 실행 중단: {_redact(ref_err)[:200]}')
+            _flush_telegram(dry_run)
+            return 2
+        ref_name = os.path.basename(ref_path)
+        if dry_run:
+            _apply_state_ref(state, ref)
+            # 예전 live 실행이 남긴 자체 universe 캐시를 쓰지 않는다 (참조와 다른 유니버스로
+            # 갈릴 수 있다) — 업비트와 같은 소스로 매 실행 재구성한다
+            state.pop('universe_cache', None)
+            # 참조본으로 갈아끼운 뒤 prev target 재계산 — target_changed 를 참조본의
+            # 직전 target 과 비교해야 업비트와 같은 기준이 된다
+            prev_combined = _norm_cash_map(state['last_target_snapshot'])
+            log(f'📎 state-ref: {ref_name} 참조 (dry-run, {_state_ref_summary(ref)})')
+        elif not state.get('members'):
+            _apply_state_ref(state, ref)
+            seeded_now = True
+            prev_combined = _norm_cash_map(state['last_target_snapshot'])
+            log(f'📎 state-ref 시드: {ref_name} → 자체 state 초기화 '
+                f'(live 최초 실행, 이후 자체 state 사용)')
+        else:
+            log('  ⚠ state-ref 무시: 자체 state 에 members 존재 (live 는 최초 1회만 시드)')
 
     session = requests.Session()
     if api is None:
@@ -2135,6 +2435,24 @@ def run_once(dry_run: bool = False, api=None) -> int:
             key = 'Cash' if k == CASH_ASSET else k
             cur_w_input[key] = cur_w_input.get(key, 0.0) + (float(v) / _pv_basis)
 
+    # state-ref dry-run 한정: drift 평가용 보유비중을 '참조 목표를 보유 중'으로 가정한다.
+    # dry-run 계좌는 dust 뿐이라 실잔고로 평가하면 매일 drift 가 발화하고, refill v2 가
+    # 업비트(목표 근접)라면 바꾸지 않았을 스냅샷 코인을 교체해 신호 비교가 오염된다.
+    # 실잔고는 balance/total_usdt/execute_delta 쪽에서 그대로 쓰인다. live 에선 절대 안 한다.
+    if dry_run and ref is not None:
+        # 업비트가 실제로 들고 있는 건 cash buffer 를 뺀 target 이므로 같은 기준으로 맞춘다
+        # (buffer 가 크면 아래 cash buffer drift 재평가가 혼자 재발화한다)
+        try:
+            _ref_buf = float(state.get('spot_cash_buffer',
+                                       state.get('cash_buffer',
+                                                 state.get('buffer_pct', CASH_BUFFER_DEFAULT))))
+        except (TypeError, ValueError):
+            _ref_buf = CASH_BUFFER_DEFAULT
+        cur_w_input = apply_cash_buffer({k: v for k, v in ref['last_target_snapshot'].items()
+                                         if k != '_ts'}, _ref_buf)
+        log(f'  📎 state-ref: drift 평가 보유비중 = 참조 last_target_snapshot'
+            f'(cash buffer {_ref_buf*100:.1f}% 반영) 가정 (실잔고 아님)')
+
     # 엔진 호출
     try:
         result = cle.compute_live_targets(
@@ -2169,13 +2487,24 @@ def run_once(dry_run: bool = False, api=None) -> int:
         fresh_str = ', '.join(f'{k}={"✓" if v else "✗"}' for k, v in result.fresh.items())
         log(f'  ⚠ Freshness 미달 ({fresh_str}) → 리밸런싱 스킵. 상태만 저장.')
         _tg(f'⚠ Freshness 미달: {fresh_str} → 스킵')
-        _save_state_unless_dry(state_path, state, dry_run)
+        if seeded_now:
+            # 이 경로엔 아래 같은 봉 복원이 없다 — 엔진이 써 둔 stale(refill 이전) target 을
+            # 저장하면 다음 실행부터 'members 있음'을 이유로 참조를 무시하고 그대로 굳는다
+            log('  📎 state-ref 시드: Freshness 미달 → 시드 state 저장 생략 (다음 실행에서 다시 시드)')
+        else:
+            _save_state_unless_dry(state_path, state, dry_run)
         _flush_telegram(dry_run)
         return 1
 
+    # state-ref: 참조(업비트)가 먼저 돌아 오늘 봉을 이미 처리한 경우 (cron 랜덤 지연으로
+    # 절반 정도의 날) 엔진은 같은 봉이라 새 봉 없음으로 답하고 멤버 last_combined(= refill v2
+    # 이전 사본)를 돌려준다. dry-run 은 여기서 스킵하면 target 로그가 없어 리포트가 현물 타겟을
+    # 못 읽고, live 최초 시드는 그 stale target 을 자체 state 에 굳혀 실주문까지 갈 수 있다.
+    _same_bar_ref = bool(ref is not None and not result.any_new_bar and (dry_run or seeded_now))
+
     # 옵션 Z: cap_defend trigger — cap_ratio < 0.99 면 any_new_bar 우회 (매일 cap 매도 시도)
     _cap_defend_fire = (_spot_cap_ratio is not None and _spot_cap_ratio < (1.0 - CAP_DEFEND_MIN_EXCESS))
-    if not result.any_new_bar and not _cap_defend_fire:
+    if not result.any_new_bar and not _cap_defend_fire and not _same_bar_ref:
         log('  ℹ 새 봉 없음 (idempotent) → 리밸런싱 스킵.')
         _save_state_unless_dry(state_path, state, dry_run)
         _tg(f'⏸ 새 봉 없음 → 스킵 (다음 봉 닫힘 대기)')
@@ -2183,6 +2512,53 @@ def run_once(dry_run: bool = False, api=None) -> int:
         return 0
     if _cap_defend_fire and not result.any_new_bar:
         log(f'  🛡️ cap_defend trigger: cap_ratio={_spot_cap_ratio:.4f} < {1.0-CAP_DEFEND_MIN_EXCESS:.2f} → any_new_bar 우회 (cap 매도 시도)')
+
+    if _same_bar_ref:
+        # 참조(업비트)가 이미 오늘 봉을 처리했다. 엔진은 같은 봉이라 members.last_combined 를 돌려주는데
+        # 그 값은 refill v2 이전 사본이다 (엔진은 refill 결과를 last_target_snapshot 에만 반영한다).
+        # 업비트가 실제로 쓴 최종 target 은 참조본의 last_target_snapshot / last_member_targets 이므로
+        # 그 값으로 맞춘다.
+        _ref_final = {k: v for k, v in ref['last_target_snapshot'].items() if k != '_ts'}
+        result.combined_target = _norm_cash_map(_ref_final)
+        _ref_mt = ref.get('last_member_targets') or {}
+        if _ref_mt:   # 없으면 엔진의 같은 봉 멤버 target 을 그대로 둔다 (멤버 줄이 사라지지 않게)
+            result.member_targets = {m: _norm_cash_map({k: v for k, v in t.items() if k != '_ts'})
+                                     for m, t in _ref_mt.items()}
+        if dry_run:
+            # 오늘의 drift 판단은 참조가 이미 했으므로 여기서 재발화하지 않는다.
+            # (live 는 실잔고 기준 drift 를 그대로 살려둔다 — 시드 첫날 실제 편차를 메워야 한다)
+            try:
+                result.drift_fire = False
+                result.drift_half_turnover = 0.0
+            except Exception:
+                pass
+            log('  📎 state-ref: 참조가 이미 오늘 봉을 처리함 → 참조의 최종 target(refill 반영)으로 같은 봉 비교 진행')
+        else:
+            # 엔진이 state 에 써 둔 stale(refill 이전) target 을 참조의 최종 target 으로 교정한 뒤
+            # 저장한다 — 시드 당일 자체 state 에 굳으면 다음 실행까지 stale 로 주문하게 된다.
+            # 엔진은 stale 기준으로 drift 를 평가했고 refill v2 가 members 스냅샷까지 바꿨을 수
+            # 있으므로, 참조 members 를 되돌리고 drift 는 실잔고 vs 참조 최종 target 으로 다시 잡는다.
+            state['members'] = copy.deepcopy(ref['members'])
+            state['last_target_snapshot'] = {**_ref_final, '_ts': cle.to_utc_iso(now)}
+            if _ref_mt:
+                state['last_member_targets'] = {
+                    m: {**{k: v for k, v in t.items() if k != '_ts'}, '_ts': cle.to_utc_iso(now)}
+                    for m, t in _ref_mt.items()}
+            try:
+                _seed_buf = float(state.get('spot_cash_buffer',
+                                            state.get('cash_buffer',
+                                                      state.get('buffer_pct', CASH_BUFFER_DEFAULT))))
+            except (TypeError, ValueError):
+                _seed_buf = CASH_BUFFER_DEFAULT
+            _ht_ref = (cle.half_turnover(cur_w_input, apply_cash_buffer(_ref_final, _seed_buf))
+                       if cur_w_input else 0.0)
+            try:
+                result.drift_fire = _ht_ref >= result.drift_threshold
+                result.drift_half_turnover = _ht_ref
+            except Exception:
+                pass
+            log('  📎 state-ref 시드: 참조가 이미 오늘 봉을 처리함 → 참조의 최종 target 으로 진행 '
+                f'(drift 는 실잔고 vs 참조 최종 target 재계산: ht={_ht_ref:.4f})')
 
     # 멤버/합산 target 로깅
     for mname, mt in result.member_targets.items():
@@ -2224,7 +2600,9 @@ def run_once(dry_run: bool = False, api=None) -> int:
         _spot_buf = float(state.get('spot_cash_buffer', state.get('cash_buffer', CASH_BUFFER_DEFAULT)))
     except (TypeError, ValueError):
         _spot_buf = CASH_BUFFER_DEFAULT
-    if _spot_buf > 0 and cur_w_input:
+    # state-ref dry-run 은 보유비중 가정에 이미 buffer 가 반영돼 있고, 이 블록의 변환은
+    # target 에 Cash 가 이미 있는 경우 apply_cash_buffer 와 달라 혼자 재발화할 수 있다 → 건너뛴다
+    if _spot_buf > 0 and cur_w_input and not (dry_run and ref is not None):
         _combined_buf = {}
         _has_cash_in_tgt = any(str(_k).lower() == 'cash' for _k in result.combined_target)
         # canary OFF (Cash=1.0) 인 경우 buffer 적용 skip — 이미 Cash 100%
@@ -2367,6 +2745,10 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='주문 없이 target/delta만 로그+텔레그램')
     parser.add_argument('--wal-mark-resolved', metavar='COID', default=None,
                         help='거래소 주문내역을 직접 확인한 뒤 해당 clientOrderId 를 수동 해소')
+    parser.add_argument('--state-ref', metavar='PATH', default=None,
+                        help='다른 실행기(업비트 LIVE)의 V24 state 파일을 엔진 상태의 출처로 '
+                             '참조한다 (읽기 전용). dry-run: 매 실행 참조. '
+                             'live: 자체 state 에 members 가 없을 때 1회 시드.')
     args = parser.parse_args()
 
     if args.wal_mark_resolved:
@@ -2397,7 +2779,7 @@ def main():
             _flush_telegram(args.dry_run)
             return
 
-        rc = run_once(dry_run=args.dry_run)
+        rc = run_once(dry_run=args.dry_run, state_ref=args.state_ref)
         if rc == 0 and not args.dry_run:
             hg.record_success()
         sys.exit(rc)
