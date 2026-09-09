@@ -2464,14 +2464,16 @@ def _run_compare(up_lines, bn_lines, day=_DAY, up_rot=None, bn_rot=None):
     if bn_rot:
         _mk_log(bn + '.' + day, bn_rot)
     old = cdr.SIDES
-    cdr.SIDES = [('업비트', up), ('바낸현물', bn)]
+    cdr.SIDES = [('업비트', up, True), ('바낸현물', bn, False)]
     try:
         sides = []
-        for n, p_ in cdr.SIDES:
-            sr = cdr.SideResult(n, p_)
+        for n, p_, live in cdr.SIDES:
+            sr = cdr.SideResult(n, p_, live)
             sr.parse(day)
             sides.append(sr)
-        body, warn = cdr.build_report(day, sides)
+        # 여기 테스트들은 '파싱·판정' 검증이 목적이라 LIVE-only 필터를 끄고 전 블록을 받는다
+        # (리포트가 dry 블록을 싣는지는 test_compare_daily_report.py 가 따로 본다).
+        body, warn = cdr.build_report(day, sides, include_dry=True)
     finally:
         cdr.SIDES = old
         shutil.rmtree(d, ignore_errors=True)
@@ -2490,7 +2492,7 @@ def test_compare_rotated_and_active_merged():
     assert up.ran is True, up.problems
     assert up.run_time == '00:05:00', up.run_time      # 회전 파일의 시작 로그를 잡아야 함
     assert up.combined and set(up.coins()) == {'BTC', 'ETH', 'SOL'}, up.combined
-    assert '✅ 코인 집합 일치' in body, body
+    assert '[업비트] 00:05:00' in body and 'BTC 33.3%' in body, body
 
 
 def test_compare_multiline_message_merged():
@@ -2511,52 +2513,22 @@ def test_compare_one_side_missing():
     up = [_start('00:05:00', label='코인'), _rec('00:05:11', _TGT),
           _rec('00:05:12', '  ✅ 거래 완료 (silent).')]
     body, warn, sides = _run_compare(up, ['(빈 로그)'])
-    assert warn is True and '미실행' in body, body
-    assert '한쪽 미실행' in body, body
+    assert warn is True and '[바낸현물] ⚠️ 미실행' in body, body
 
 
-def test_compare_cron_window_rule():
-    """사이클 ID 가 없으면 양쪽 모두 cron 창(09:05~09:12 KST) 안일 때만 ✅."""
-    # 00:05 UTC == 09:05 KST → 창 안
-    up = [_start('00:05:00', label='코인'), _rec('00:05:11', _TGT),
-          _rec('00:05:12', '  ✅ 거래 완료 (silent).')]
-    bn = [_start('00:05:30'), _rec('00:05:41', _TGT),
-          _rec('00:05:42', '  ✅ 거래 완료 (silent).')]
-    body, warn, _ = _run_compare(up, bn)
-    assert '✅ 실행 쌍 정합 (양쪽 cron 창 내' in body, body
-
-    # 창 밖(수동 실행) → ✅ 금지
-    bn2 = [_start('05:52:00'), _rec('05:52:11', _TGT),
-           _rec('05:52:12', '  ✅ 거래 완료 (silent).')]
-    body2, warn2, _ = _run_compare(up, bn2)
-    assert '실행 쌍 확인 불가' in body2 and warn2 is True, body2
-    assert 'cron 창 밖' in body2, body2
-
-
-def test_compare_cycle_id_pairing():
-    """양쪽 모두 사이클 ID 가 있으면 ID 일치를 요구한다."""
+def test_compare_cycle_id_parsed_into_block():
+    """래퍼가 주입한 사이클 ID 는 파싱돼 블록 헤더에 표기된다."""
     up = [_start('00:05:00', rid='0905abcd', label='코인'), _rec('00:05:11', _TGT, '0905abcd'),
           _rec('00:05:12', '  ✅ 거래 완료 (silent).', '0905abcd')]
     bn = [_start('00:05:30', rid='0905abcd'), _rec('00:05:41', _TGT, '0905abcd'),
           _rec('00:05:42', '  ✅ 거래 완료 (silent).', '0905abcd')]
     body, warn, sides = _run_compare(up, bn)
     assert sides[0].cycle_id == '0905abcd' and sides[1].cycle_id == '0905abcd'
-    assert '사이클 ID 0905abcd 일치' in body, body
-
-    bn2 = [_start('00:05:30', rid='0905ffff'), _rec('00:05:41', _TGT, '0905ffff'),
-           _rec('00:05:42', '  ✅ 거래 완료 (silent).', '0905ffff')]
-    body2, warn2, _ = _run_compare(up, bn2)
-    assert '사이클 ID 0905abcd vs 0905ffff' in body2 and warn2 is True, body2
+    assert 'cycle=0905abcd' in body, body
 
 
-def test_compare_kst_utc_boundary():
-    """KST 날짜 기준 + UTC 로그 시각 매핑 (09:05 KST = 00:05 UTC 같은 날짜)."""
-    assert cdr._in_cron_window('00:05:00') is True     # 09:05 KST
-    assert cdr._in_cron_window('00:12:00') is True     # 09:12 KST
-    assert cdr._in_cron_window('00:13:00') is False
-    assert cdr._in_cron_window('15:05:00') is False    # 00:05 KST (다음날 새벽)
-    assert cdr._in_cron_window('bad') is False
-    # 서비스 날짜는 KST 기준
+def test_compare_service_date_is_kst():
+    """서비스 날짜는 KST 기준 (09:05 KST = 00:05 UTC 로 같은 날짜에 들어온다)."""
     import datetime as _dt
     try:
         from zoneinfo import ZoneInfo

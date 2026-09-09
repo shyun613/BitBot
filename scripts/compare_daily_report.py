@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """일일 운용 리포트 (업비트 현물 / 바낸현물 / 바이낸스 선물).
 
-매일 09:20 KST cron 용. 같은 날 09:05 실행의 세 executor 로그를 파싱해
+매일 09:20 KST cron 용. 같은 날 09:05 실행의 executor 로그를 파싱해
 카나리 상태 / 선정 코인 / 목표 비중 / 실행 결과를 요약하고 텔레그램으로 발송한다.
-현물 두 축(업비트 vs 바낸현물)은 같은 전략·같은 자산이라 1:1 로 비교하고,
-선물은 전략·자산이 달라 비교 대상이 아니라 결과만 함께 보여준다.
+싣는 것은 LIVE(실거래) 실행뿐이다 — dry-run 실행 블록과 옛 '현물 비교' 섹션은
+싣지 않는다 (2026-09-09 사용자 결정, 두 축 비교 검증이 끝났다).
+축을 실거래로 돌릴 땐 SIDES 의 live_expected(선물은 FUT_LIVE_EXPECTED)를 True 로
+바꾸면 그 축이 다시 리포트에 실린다.
 
 대상 로그 (trade/):
   - executor_coin.log          (업비트 KRW 현물)
@@ -16,29 +18,23 @@
   선물: YYYY-MM-DD HH:MM:SS,mmm LEVEL <message>   (python logging 기본 포맷)
   (message 가 여러 줄이면 후속 줄엔 타임스탬프 없음 → 직전 레코드에 이어붙임)
 
-리포트 형태:
+리포트 형태 (LIVE 인 업비트만 실린 날 — 바낸현물/선물 dry-run 은 생략된다):
   📊 일일 운용 리포트 2026-08-31 (KST 기준)
 
   [업비트] 09:05:58 (LIVE) ✅ 거래 완료
     타겟: BTC 33.3%, ETH 33.3%, SOL 33.3% (cash=0.0%)
     평가액: 2,100,000원 (+5.0%)
 
-  [바낸현물] 09:05:38 (dry) cycle=09055998 ✅ 거래 완료
-    타겟: BTC 33.3%, ETH 33.3%, SOL 33.3% (cash=0.0%)
+  블록을 싣는 기준:
+    - live_expected=True 인 축은 항상 싣는다. 미실행이면 '⚠️ 미실행' 로 드러난다(경보 유지).
+    - live_expected=False 인 축은 실제로 LIVE(dry_run=False)로 돈 날에만 싣는다 —
+      설정을 깜빡해도 실거래 결과는 숨기지 않는다.
+    - 그 외(설정도 dry, 실행도 LIVE 아님)는 블록 자체를 생략한다.
+    - 실을 블록이 하나도 없으면 '⚠️ 표시할 LIVE 실행이 없습니다' 한 줄만 남는다.
+    - --include-dry 를 주면 필터를 끄고 dry-run 블록까지 전부 렌더한다 (디버그용).
+  LIVE 로 기대한 축이 dry-run/불명 으로 돌았으면 그 블록에 '⚠️ 실행 모드' 경고가 붙는다.
 
-  [선물] 09:05:32 (dry) run=20260831_090532 ✅ 정상 완료
-    타겟: BTC 33.3% (L2), ETH 33.3% (L2), cash 33.4% (refill v2 반영)
-    PV: $0.00
-
-  ── 현물 비교 ──
-  ✅ 실행 쌍 정합 / ✅ 카나리 일치 / ✅ 코인 집합 일치 / ✅ 비중 일치
-  실행 모드: 업비트=LIVE, 바낸현물=dry-run
-
-  실행 모드(dry/LIVE)는 정합 판정 대상이 아니다 — 비교 대상은 전략 산출물(타겟·카나리)이고,
-  운영 조합이 '업비트 LIVE + 바낸현물 dry-run' 인 게 정상 상태라 정보로만 표시한다.
-
-  블록의 '카나리:' 줄은 평상시(전 멤버 ON·양쪽 일치)엔 생략하고, OFF·판별 불가·불일치·
-  한쪽 미실행일 때만 싣는다. 비교 섹션의 카나리 판정 줄은 항상 나온다.
+  블록의 '카나리:' 줄은 평상시(전 멤버 ON)엔 생략하고, OFF·판별 불가일 때만 싣는다.
 
   '평가액:' 줄은 업비트(실거래 계좌)에만 붙는다. 원금은 trade/report_principal.json
   ({"principal_krw": ..., "last_deposit_check": ...})에 두고 KRW 입금분만 자동 가산한다.
@@ -53,7 +49,8 @@ Usage:
   python3 compare_daily_report.py            # 텔레그램 발송
   python3 compare_daily_report.py --stdout   # 표준출력 (테스트)
   python3 compare_daily_report.py --date 2026-08-31 --stdout
-  python3 compare_daily_report.py --no-fut --stdout    # 현물 2축만
+  python3 compare_daily_report.py --no-fut --stdout        # 선물 블록 생략
+  python3 compare_daily_report.py --include-dry --stdout   # dry-run 블록까지 (디버그)
 """
 
 from __future__ import annotations
@@ -91,20 +88,25 @@ except ImportError:
     UPBIT_SECRET_KEY = os.environ.get('UPBIT_SECRET_KEY', '')
 
 
-TG_PREFIX = '비교리포트'
+TG_PREFIX = '운용리포트'   # 비교 섹션을 없앤 뒤로 '비교'가 아니다 (2026-09-09)
 WARN_HEADER = '⚠️ 점검 필요'
 KST_TZ = 'Asia/Seoul'
 KST_FIXED = timezone(timedelta(hours=9))   # tzdata 없는 환경용 고정 오프셋 fallback
-WEIGHT_TOL = 0.01  # 1%p 초과 시 불일치
 
+# (이름, 로그경로, live_expected)
+# live_expected = '이 축은 실거래로 돌 것으로 기대한다'. True 인 축만 미실행 시 경보가 뜬다.
+# dry-run → 실거래 전환 시엔 cron 에서 --dry-run 을 빼는 것과 '함께' 이 값을 True 로 바꾼다
+# (둘 중 하나만 바꿔도 리포트가 조용해지지 않는다 — 아래 _include 주석 참조).
 SIDES = [
-    ('업비트', os.path.join(TRADE_DIR, 'executor_coin.log')),
-    ('바낸현물', os.path.join(TRADE_DIR, 'executor_coin_binance.log')),
+    ('업비트', os.path.join(TRADE_DIR, 'executor_coin.log'), True),
+    ('바낸현물', os.path.join(TRADE_DIR, 'executor_coin_binance.log'), False),
 ]
 
-# 선물(V25)은 전략·자산이 달라 현물과 1:1 비교하지 않는다. 결과만 함께 싣는다.
+# 선물(V25)은 결과만 함께 싣는다.
 FUT_NAME = '선물'
 FUT_LOG = os.path.join(TRADE_DIR, 'binance_trade.log')
+# 선물도 현물 SIDES 와 같은 규칙 — 실거래 전환 시 cron 의 --dry-run 제거와 함께 True 로 바꾼다.
+FUT_LIVE_EXPECTED = False
 
 # 업비트 실계좌 평가액/원금 (업비트 블록에만 싣는다 — 바낸현물·선물은 대상 아님)
 UPBIT_API = 'https://api.upbit.com'
@@ -243,10 +245,6 @@ RE_TOKEN = re.compile(r'([A-Z0-9]+):([\d.]+)%')
 RE_STATE_REF = re.compile(r'^📎 state-ref(?: 시드)?: (.+?) (?:참조|→)')
 
 SEVERITY = {'ok': 0, 'skip': 1, 'warn': 2, 'error': 3}
-PAIR_MAX_GAP_SEC = 30 * 60  # 두 실행 시작 시각 차가 이보다 크면 동일 사이클 쌍으로 보기 어려움
-# cron 실행 창 (KST). 래퍼의 랜덤 지연(<60s) + 실행 시간을 감안한 범위.
-CRON_WINDOW_KST = (9 * 3600 + 5 * 60, 9 * 3600 + 12 * 60)
-LOG_TZ_OFFSET_HOURS = 9   # 로그 타임스탬프(서버 로컬=UTC) → KST 변환
 
 # 시작 로그 없이 끝난 경우의 원인 후보 (M)
 ABORT_HINTS: List[Tuple[str, str]] = [
@@ -395,9 +393,10 @@ FUT_RESULT_MARKERS: List[Tuple[str, str, str]] = [
 
 
 class SideResult:
-    def __init__(self, name: str, path: str):
+    def __init__(self, name: str, path: str, live_expected: bool = False):
         self.name = name
         self.path = path
+        self.live_expected = live_expected     # 실거래로 돌 것으로 기대하는 축인가
         self.log_exists = False
         self.ran = False
         self.run_time: Optional[str] = None
@@ -500,17 +499,19 @@ class SideResult:
     def coins(self) -> Dict[str, float]:
         return {k: v for k, v in self.combined.items() if k != 'Cash'}
 
-    def canary_overall(self) -> Optional[str]:
-        """멤버 키가 서로 다를 때 쓰는 종합 판정 (하나라도 ON 이면 ON)."""
-        if not self.canary:
-            return None
-        return 'ON' if any(v == 'ON' for v in self.canary.values()) else 'OFF'
-
     def canary_str(self) -> str:
         if not self.canary:
             return '알 수 없음'
         body = ', '.join(f'{m}={s}' for m, s in sorted(self.canary.items()))
         return f'{body} ({self.canary_source})' if self.canary_source else body
+
+    def canary_visible(self) -> bool:
+        """평상시(전 멤버 ON)엔 숨기고 OFF/판별 불가만 알린다.
+
+        '타겟 추론' 으로 나온 ON 도 매일 뜨는 평상 상태라 숨긴다.
+        타겟 로그가 없어 추론을 못 한 날은 canary 가 비어 '알 수 없음' 이라 표시된다.
+        """
+        return (not self.canary) or any(v != 'ON' for v in self.canary.values())
 
     def target_str(self) -> str:
         c = self.coins()
@@ -529,9 +530,11 @@ class FutResult:
     비교 대상이 아니라 '그날 선물은 어떻게 돌았나'를 보여주는 용도다.
     """
 
-    def __init__(self, name: str = FUT_NAME, path: str = FUT_LOG):
+    def __init__(self, name: str = FUT_NAME, path: str = FUT_LOG,
+                 live_expected: bool = False):
         self.name = name
         self.path = path
+        self.live_expected = live_expected     # 실거래로 돌 것으로 기대하는 축인가
         self.log_exists = False
         self.ran = False
         self.run_time: Optional[str] = None
@@ -953,16 +956,6 @@ def _read_records(path: str, day: str) -> List[Tuple[str, str, str]]:
     return out
 
 
-def _in_cron_window(t: Optional[str]) -> bool:
-    """로그 시각(서버 로컬=UTC)이 KST cron 창 안인가."""
-    try:
-        h, m, sec = (int(x) for x in (t or '').split(':'))
-    except Exception:
-        return False
-    kst = ((h + LOG_TZ_OFFSET_HOURS) % 24) * 3600 + m * 60 + sec
-    return CRON_WINDOW_KST[0] <= kst <= CRON_WINDOW_KST[1]
-
-
 def _parse_weights(coins_part: str, cash_pct: str) -> Dict[str, float]:
     """'BTC:33.3%, ETH:33.3%' + cash '0.0' → {'BTC':0.333, 'ETH':0.333, 'Cash':0.0}"""
     w: Dict[str, float] = {}
@@ -974,20 +967,6 @@ def _parse_weights(coins_part: str, cash_pct: str) -> Dict[str, float]:
     except (TypeError, ValueError):
         w['Cash'] = 0.0
     return w
-
-
-def _time_gap_sec(t1: Optional[str], t2: Optional[str]) -> Optional[int]:
-    """'HH:MM:SS' 두 개의 절대 차이(초). 파싱 실패 시 None."""
-    def _sec(t):
-        try:
-            h, m, s = (int(x) for x in t.split(':'))
-            return h * 3600 + m * 60 + s
-        except Exception:
-            return None
-    a, b = _sec(t1 or ''), _sec(t2 or '')
-    if a is None or b is None:
-        return None
-    return abs(a - b)
 
 
 def _service_today() -> str:
@@ -1244,30 +1223,31 @@ def _load_principal(now: datetime) -> Tuple[Optional[float], str]:
 
 
 # ─── 리포트 ───
-def _spot_canary_visible(sides: List[SideResult]) -> bool:
-    """현물 블록에 카나리 줄을 실을지.
+def _include(res, include_dry: bool = False) -> bool:
+    """이 실행 블록을 리포트에 실을지 (SideResult / FutResult 공용).
 
-    평상시(양쪽 실행 + 전 멤버 ON + 일치)엔 매일 같은 줄이라 노이즈다 → 숨긴다.
-    OFF 가 하나라도 있거나, 판별 불가거나, 불일치거나, 한쪽이 미실행이면
-    판단 근거가 필요하므로 양쪽 다 보여준다 (fail-loud).
+    리포트는 LIVE 실행만 싣는다. 다만 두 가지는 반드시 지킨다:
+      ① live_expected 인 축은 미실행이어도 싣는다 — 그래야 '⚠️ 미실행' 경보가 그대로
+         뜬다. LIVE 로 돌아야 할 축이 안 돈 날을 조용히 넘기면 안 된다.
+      ② 설정상 dry 라도 실제로 LIVE(dry_run=False)로 돈 실행은 절대 숨기지 않는다 —
+         live_expected 를 깜빡 안 켠 채 실거래로 돌린 날의 결과가 사라지면 안 된다.
+    그 외(설정도 dry, 실행도 LIVE 가 아님)는 블록 자체를 생략한다.
+    include_dry=True 면 필터를 끄고 전부 싣는다 (디버그용).
     """
-    a, b = sides[0], sides[1]
-    if not (a.ran and b.ran and a.canary and b.canary):
+    if include_dry:
         return True
-    if any(v != 'ON' for s in sides for v in s.canary.values()):
-        return True
-    # 전 멤버 ON 이면 아래는 항상 '일치' 지만, 판정 규칙을 그대로 남겨 둔다
-    if set(a.canary) == set(b.canary):
-        return any(a.canary[k] != b.canary[k] for k in a.canary)
-    return a.canary_overall() != b.canary_overall()
+    return bool(res.live_expected) or (res.ran and res.dry_run is False)
 
 
-def _mode_word(s: SideResult) -> str:
-    """비교 섹션의 실행 모드 표기 — 판정이 아니라 정보 표시용."""
-    if s.dry_run is None:
-        return '?'
-    word = 'dry-run' if s.dry_run else 'LIVE'
-    return f'{word}(state-ref)' if s.state_ref else word
+def _mode_mismatch_line(res) -> Optional[str]:
+    """LIVE 로 기대한 축이 dry-run/불명 으로 돈 경우의 경고 줄 (아니면 None).
+
+    미실행은 '⚠️ 미실행' 경로가 이미 알리므로 여기서 중복으로 표시하지 않는다.
+    """
+    if not (res.live_expected and res.ran and res.dry_run is not False):
+        return None
+    word = 'dry-run' if res.dry_run else '불명'
+    return f'  ⚠️ 실행 모드: LIVE 기대인데 {word} 으로 실행됨'
 
 
 def _upbit_value_line(uv: Dict[str, object]) -> Tuple[str, bool]:
@@ -1324,28 +1304,29 @@ def _fut_lines(fut: 'FutResult') -> Tuple[List[str], bool]:
 
 def build_report(day: str, sides: List[SideResult],
                  fut: Optional['FutResult'] = None,
-                 upbit_value: Optional[Dict[str, object]] = None) -> Tuple[str, bool]:
-    """(본문, 경고여부) 반환.
+                 upbit_value: Optional[Dict[str, object]] = None,
+                 include_dry: bool = False) -> Tuple[str, bool]:
+    """(본문, 경고여부) 반환 — LIVE 실행 결과만 싣는다.
 
-    sides = 현물 2축(업비트/바낸현물) — 서로 1:1 비교한다.
-    fut   = 선물(V25) — 전략·자산이 달라 비교하지 않고 결과만 싣는다 (None 이면 생략).
-    upbit_value = {'value': 평가액|None, 'pct': 등락률|None, 'note': 메모} — 업비트 블록에만
-            '평가액' 줄을 더한다. None(미주입)이면 줄 자체가 없고 출력은 종전과 완전히 같다.
+    sides = 현물 축들. 개수 전제가 없다 (0개여도, 3개여도 죽지 않는다).
+    fut   = 선물(V25) — 결과만 싣는다 (None 이면 생략).
+    upbit_value = {'value': 평가액|None, 'pct': 등락률|None, 'note': 메모} — 첫 side
+            (=업비트) 블록에만 '평가액' 줄을 더한다. None(미주입)이면 줄 자체가 없다.
+    include_dry = True 면 포함 필터를 꺼서 dry-run 블록까지 전부 렌더한다 (디버그용).
 
-    블록의 '카나리' 줄은 이상할 때만 싣는다(_spot_canary_visible / FutResult.canary_visible).
-    '── 현물 비교 ──' 의 카나리 일치/불일치 판정은 그대로 항상 나온다.
+    dry-run 블록과 옛 '── 현물 비교 ──' 섹션은 싣지 않는다 (2026-09-09 사용자 결정 —
+    두 축 비교 검증이 끝났다). 어떤 블록을 싣는지는 _include 참조.
+    블록의 '카나리' 줄은 이상할 때만 싣는다 (SideResult/FutResult.canary_visible).
     """
-    a, b = sides[0], sides[1]
     warn = False
     lines = [f'📊 일일 운용 리포트 {day} (KST 기준)']
-    # 상대편 상태를 알아야 정해지므로 블록 렌더링 전에 한 번만 계산한다
-    show_canary = _spot_canary_visible(sides)
-
-    # 실행 모드(dry/LIVE)는 정합 판정 대상이 아니라 경고하지 않는다. 비교 대상은 전략
-    # 산출물(타겟·카나리)이고, '업비트 LIVE + 바낸현물 dry-run' 이 정상 운영 조합이다
-    # (2026-09-01 사용자 결정). 모드는 블록/비교 섹션에 정보로만 싣는다.
+    first = sides[0] if sides else None    # 평가액 줄이 붙는 축 (업비트)
+    shown = 0
 
     for s in sides:
+        if not _include(s, include_dry):
+            continue
+        shown += 1
         mode = '?' if s.dry_run is None else ('dry' if s.dry_run else 'LIVE')
         if s.state_ref:
             mode += '(state-ref)'
@@ -1358,7 +1339,7 @@ def build_report(day: str, sides: List[SideResult],
                 reason += ' (원인 후보: cron 미실행 / 래퍼 flock / health lock — 로그에 흔적 없음)'
             lines.append(f'\n[{s.name}] ⚠️ 미실행 — {reason}')
             # 미실행일수록 실계좌 상태 확인이 급하다 — 업비트면 평가액은 그래도 싣는다
-            if upbit_value is not None and s is a:
+            if upbit_value is not None and s is first:
                 vline, _vwarn = _upbit_value_line(upbit_value)
                 lines.append(vline)
             continue
@@ -1370,123 +1351,35 @@ def build_report(day: str, sides: List[SideResult],
             warn = True
         cyc = f' cycle={s.cycle_id}' if s.cycle_id else ''
         lines.append(f'\n[{s.name}] {s.run_time} ({mode}){cyc} {icon} {s.result_label}{multi}')
-        if show_canary:
+        mismatch = _mode_mismatch_line(s)
+        if mismatch:
+            lines.append(mismatch)
+            warn = True
+        if s.canary_visible():   # 평상시(전 멤버 ON)엔 생략 — OFF/판별 불가만 알린다
             lines.append(f'  카나리: {s.canary_str()}')
         lines.append(f'  타겟: {s.target_str()}')
         # 실계좌 평가액은 업비트(sides[0]) 블록에만 — 바낸현물/선물은 대상이 아니다
-        if upbit_value is not None and s is a:
+        if upbit_value is not None and s is first:
             vline, vwarn = _upbit_value_line(upbit_value)
             lines.append(vline)
             warn = warn or vwarn
         if s.issues:
             lines.append(f'  이슈: {", ".join(s.issues)}')
 
-    if fut is not None:
+    if fut is not None and _include(fut, include_dry):
+        shown += 1
         flines, fwarn = _fut_lines(fut)
         lines.extend(flines)
         warn = warn or fwarn
-
-    # 아래는 현물 2축 전용 비교 — 선물은 전략·자산이 달라 비교하지 않는다.
-    lines.append('\n── 현물 비교 ──')
-    if not (a.ran and b.ran):
-        lines.append('⚠️ 한쪽 미실행 → 비교 불가')
-        return '\n'.join(lines), True
-
-    # 0) 실행 쌍 신뢰성 (M)
-    #    - 양쪽 모두 사이클 ID 가 있으면 ID 일치를 요구 (권위 판정)
-    #    - 한쪽이라도 ID 가 없으면(업비트판은 수정 금지라 rid 를 못 찍음)
-    #      '양쪽 시작이 cron 창(09:05~09:12 KST) 안 + 시간차 허용범위' 일 때만 ✅
-    gap = _time_gap_sec(a.run_time, b.run_time)
-    if a.cycle_id and b.cycle_id:
-        if a.cycle_id == b.cycle_id:
-            lines.append(f'✅ 실행 쌍 정합 (사이클 ID {a.cycle_id} 일치)')
-        else:
-            lines.append(f'⚠️ 실행 쌍 불일치 — 사이클 ID {a.cycle_id} vs {b.cycle_id}')
-            warn = True
-    elif gap is None:
-        lines.append('⚠️ 실행 시각 파싱 불가 → 실행 쌍 확인 불가')
-        warn = True
-    else:
-        in_win = _in_cron_window(a.run_time) and _in_cron_window(b.run_time)
-        if in_win and gap <= PAIR_MAX_GAP_SEC:
-            lines.append(f'✅ 실행 쌍 정합 (양쪽 cron 창 내, 시작 시각 차 {gap/60:.0f}분)')
-        else:
-            why = []
-            if not _in_cron_window(a.run_time):
-                why.append(f'{a.name} cron 창 밖({a.run_time})')
-            if not _in_cron_window(b.run_time):
-                why.append(f'{b.name} cron 창 밖({b.run_time})')
-            if gap > PAIR_MAX_GAP_SEC:
-                why.append(f'시작 시각 차 {gap/60:.0f}분 > {PAIR_MAX_GAP_SEC//60}분')
-            lines.append('⚠️ 실행 쌍 확인 불가 — ' + ', '.join(why)
-                         + f' (시작 시각 차 {gap/60:.0f}분)')
+        mismatch = _mode_mismatch_line(fut)
+        if mismatch:
+            lines.append(mismatch)
             warn = True
 
-    # 0-2) 실행 모드 — 정합 판정 아님, 정보 표시만 (모드 불명 warn 은 파싱 단계 M1 이 담당)
-    if a.dry_run == b.dry_run and a.dry_run is not None:
-        lines.append(f'실행 모드: 양쪽 {_mode_word(a)}')
-    else:
-        lines.append(f'실행 모드: {a.name}={_mode_word(a)}, {b.name}={_mode_word(b)}')
-
-    # 0-3) state-ref — 한쪽이 상대 state 를 참조하면 두 target 은 독립 신호가 아니다.
-    #      경고는 아니지만(정상 운영 조합) 비교의 의미가 달라지므로 정보로 남긴다.
-    for s in sides:
-        if s.state_ref:
-            lines.append(f'ℹ {s.name} 는 {s.state_ref} 를 state-ref 로 참조 → '
-                         f'타겟 일치는 파이프라인 검증이며 신호 독립 비교가 아님')
-
-    # 1) 카나리 — 멤버 키가 같으면 멤버별, 다르면 (추론 경로 차이) 종합 ON/OFF 로 비교
-    if not a.canary or not b.canary:
-        lines.append('⚠️ 카나리: 한쪽 이상 판별 불가')
+    if not shown:
+        # 전부 dry-run 이라 실을 게 없는 날. 조용한 리포트는 '정상'과 구분이 안 되므로 알린다.
+        lines.append('\n⚠️ 표시할 LIVE 실행이 없습니다 (dry-run 실행은 리포트에서 제외)')
         warn = True
-    elif set(a.canary) == set(b.canary):
-        diffs = [f'{k}: {a.canary[k]} vs {b.canary[k]}'
-                 for k in sorted(a.canary) if a.canary[k] != b.canary[k]]
-        if diffs:
-            lines.append('⚠️ 카나리 불일치 — ' + ', '.join(diffs))
-            warn = True
-        else:
-            lines.append('✅ 카나리 일치')
-    else:
-        oa, ob = a.canary_overall(), b.canary_overall()
-        if oa == ob:
-            lines.append(f'✅ 카나리 일치 (종합 {oa}; 멤버 키 상이 — {sorted(a.canary)} vs {sorted(b.canary)})')
-        else:
-            lines.append(f'⚠️ 카나리 불일치 (종합) — {a.name}={oa}, {b.name}={ob}')
-            warn = True
-
-    # 타겟 로그가 없는 실행(freshness 스킵 등)은 코인/비중 비교 불가
-    if not a.combined or not b.combined:
-        missing = ', '.join(s.name for s in sides if not s.combined)
-        lines.append(f'⚠️ combined target 로그 없음/파싱 실패: {missing} → 코인·비중 비교 불가')
-        return '\n'.join(lines), True
-
-    # 2) 코인 집합
-    ca, cb = set(a.coins()), set(b.coins())
-    if ca != cb:
-        only_a = ', '.join(sorted(ca - cb)) or '-'
-        only_b = ', '.join(sorted(cb - ca)) or '-'
-        lines.append(f'⚠️ 코인 집합 불일치 — {a.name}만: {only_a} / {b.name}만: {only_b}')
-        warn = True
-    elif not ca:
-        lines.append('✅ 코인 집합 일치 (양쪽 CASH only)')
-    else:
-        lines.append(f'✅ 코인 집합 일치 ({len(ca)}종목)')
-
-    # 3) 비중 오차
-    wa, wb = a.combined, b.combined
-    allk = set(wa) | set(wb)
-    gaps = []
-    for k in sorted(allk):
-        d = abs(wa.get(k, 0.0) - wb.get(k, 0.0))
-        if d > WEIGHT_TOL:
-            gaps.append(f'{k} {d*100:.1f}%p')
-    if gaps:
-        lines.append(f'⚠️ 비중 오차 >{WEIGHT_TOL*100:.0f}%p — ' + ', '.join(gaps))
-        warn = True
-    else:
-        maxd = max((abs(wa.get(k, 0.0) - wb.get(k, 0.0)) for k in allk), default=0.0)
-        lines.append(f'✅ 비중 일치 (최대 오차 {maxd*100:.2f}%p)')
 
     return '\n'.join(lines), warn
 
@@ -1513,26 +1406,29 @@ def _upbit_value_for(day: str) -> Optional[Dict[str, object]]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='일일 운용 리포트 (업비트/바낸현물 비교 + 선물 결과)')
+        description='일일 운용 리포트 (LIVE 실행 결과만 — dry-run 블록은 생략)')
     parser.add_argument('--stdout', action='store_true', help='텔레그램 대신 표준출력')
     parser.add_argument('--date', default=None, help='대상 로그 날짜 YYYY-MM-DD (기본: KST 오늘)')
     parser.add_argument('--no-fut', action='store_true', help='선물 블록 생략')
+    parser.add_argument('--include-dry', action='store_true',
+                        help='dry-run 실행 블록도 함께 출력 (디버그용)')
     args = parser.parse_args()
 
     day = args.date or _service_today()
 
     sides = []
-    for name, path in SIDES:
-        s = SideResult(name, path)
+    for name, path, live_expected in SIDES:
+        s = SideResult(name, path, live_expected)
         s.parse(day)
         sides.append(s)
 
     fut = None
     if not args.no_fut:
-        fut = FutResult(FUT_NAME, FUT_LOG)
+        fut = FutResult(FUT_NAME, FUT_LOG, FUT_LIVE_EXPECTED)
         fut.parse(day)
 
-    body, warn = build_report(day, sides, fut, _upbit_value_for(day))
+    body, warn = build_report(day, sides, fut, _upbit_value_for(day),
+                              include_dry=args.include_dry)
     if warn:
         body = WARN_HEADER + '\n' + body
 

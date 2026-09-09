@@ -82,8 +82,9 @@ def _write(tmp_path, text, name='binance_trade.log'):
     return p
 
 
-def _fut(tmp_path, text):
-    r = cdr.FutResult('선물', _write(tmp_path, text))
+def _fut(tmp_path, text, live=False):
+    """live=True 면 FUT_LIVE_EXPECTED 를 켠 것과 같다 (실거래 기대 축)."""
+    r = cdr.FutResult('선물', _write(tmp_path, text), live)
     r.parse(DAY)
     return r
 
@@ -328,37 +329,46 @@ def _spot_canary(state):
 
 
 def _spot_sides(tmp_path, canary_a=None, canary_b=None,
-                tgt='BTC:33.3%, ETH:33.3%', cash='33.4', dry=(True, True)):
-    """dry=(업비트, 바낸현물) — False 면 'Executor 시작 (dry_run=False)' = LIVE 로 파싱된다."""
+                tgt='BTC:33.3%, ETH:33.3%', cash='33.4', dry=(False, True),
+                live=(True, False)):
+    """현물 2축을 만든다.
+
+    dry=(업비트, 바낸현물) — False 면 'Executor 시작 (dry_run=False)' = LIVE 로 파싱된다.
+    live=(업비트, 바낸현물) — SideResult.live_expected (설정상 실거래를 기대하는 축인가).
+    기본값은 운영 조합 그대로 = 업비트 LIVE(기대 True) + 바낸현물 dry-run(기대 False)
+    → 리포트엔 업비트 블록만 실린다.
+    """
     sides = []
-    for (name, fname), state, dry_run in zip(SPOT_SIDES, (canary_a, canary_b), dry):
+    for (name, fname), state, dry_run, live_exp in zip(
+            SPOT_SIDES, (canary_a, canary_b), dry, live):
         body = SPOT_LOG.format(day=DAY, rid='0005abcd', canary=_spot_canary(state),
                                tgt=tgt, cash=cash, dry=dry_run)
         path = _write(tmp_path, body, fname)
-        s = cdr.SideResult(name, path)
+        s = cdr.SideResult(name, path, live_exp)
         s.parse(DAY)
         sides.append(s)
     return sides
 
 
-def test_build_report_has_three_sections_and_spot_compare(tmp_path):
+def test_build_report_renders_live_blocks_only(tmp_path):
+    """운영 조합(업비트 LIVE + 나머지 dry) → 업비트 블록만 실린다."""
     sides = _spot_sides(tmp_path)
     fut = _fut(tmp_path, SAMPLE_BLOCK)
     body, warn = cdr.build_report(DAY, sides, fut)
 
     assert body.startswith('📊 일일 운용 리포트 2026-08-31 (KST 기준)')
-    assert '[업비트]' in body and '[바낸현물]' in body and '[선물]' in body
-    assert '\n── 현물 비교 ──' in body        # 헤더 변경
-    assert '\n── 비교 ──' not in body         # 옛 헤더는 남지 않는다
-    # 현물 비교 로직은 그대로 — 선물이 끼어들지 않는다
-    assert '✅ 실행 쌍 정합' in body
-    assert '✅ 코인 집합 일치' in body
-    assert '✅ 비중 일치' in body
-    # 선물 블록 내용
-    assert 'run=20260831_090532' in body
-    assert 'BTC 33.3% (L2)' in body
-    assert 'PV: $0.00' in body
+    assert '[업비트] 00:05:10 (LIVE)' in body
+    assert '  타겟: BTC 33.3%, ETH 33.3% (cash=33.4%)' in body
+    assert '[바낸현물]' not in body and '[선물]' not in body
+    assert '── 현물 비교 ──' not in body
     assert warn is False
+
+    # 선물 블록 자체는 그대로다 — 포함 조건만 다르다
+    live_fut = _fut(tmp_path, SAMPLE_BLOCK, live=True)
+    body2, _warn2 = cdr.build_report(DAY, sides, live_fut)
+    assert 'run=20260831_090532' in body2
+    assert 'BTC 33.3% (L2)' in body2
+    assert 'PV: $0.00' in body2
 
 
 def test_build_report_warns_when_fut_errors(tmp_path):
@@ -366,7 +376,7 @@ def test_build_report_warns_when_fut_errors(tmp_path):
     fut = _fut(tmp_path, (
         "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
         "2026-08-31 00:05:33,100 ERROR BTC 데이터 누락! 매매 중단. 이전 포지션 유지.\n"
-    ))
+    ), live=True)
     body, warn = cdr.build_report(DAY, sides, fut)
     assert warn is True
     assert '🚨 매매 중단' in body
@@ -377,7 +387,7 @@ def test_build_report_warns_when_fut_errors(tmp_path):
 
 def test_build_report_warns_when_fut_missing(tmp_path):
     sides = _spot_sides(tmp_path)
-    fut = cdr.FutResult('선물', os.path.join(str(tmp_path), 'nope.log'))
+    fut = cdr.FutResult('선물', os.path.join(str(tmp_path), 'nope.log'), True)
     fut.parse(DAY)
     body, warn = cdr.build_report(DAY, sides, fut)
     assert warn is True
@@ -388,7 +398,7 @@ def test_build_report_without_fut_is_backward_compatible(tmp_path):
     sides = _spot_sides(tmp_path)
     body, warn = cdr.build_report(DAY, sides)
     assert '[선물]' not in body
-    assert '\n── 현물 비교 ──' in body
+    assert '── 현물 비교 ──' not in body
     assert warn is False
 
 
@@ -886,74 +896,42 @@ def test_r2_3_real_marker_rows_still_match():
 
 
 # ═══════════ 카나리 줄 조건부 표시 (평상시 숨김, 이상 시 표시) ═══════════
-def test_canary_line_hidden_when_all_on_and_matching(tmp_path):
-    """양쪽 실행 + 전 멤버 ON + 일치 → 블록에선 숨기고, 비교 판정은 그대로 낸다."""
-    sides = _spot_sides(tmp_path)                       # 타겟 추론 → 양쪽 ON
-    fut = _fut(tmp_path, SAMPLE_BLOCK)                  # 타겟 추론 → ON
+def test_canary_line_hidden_when_all_on(tmp_path):
+    """전 멤버 ON 이면 매일 같은 줄이라 블록에서 숨긴다 (side 별 판단)."""
+    sides = _spot_sides(tmp_path)                       # 타겟 추론 → ON
+    fut = _fut(tmp_path, SAMPLE_BLOCK, live=True)       # 타겟 추론 → ON
     body, warn = cdr.build_report(DAY, sides, fut)
 
-    assert '  카나리:' not in body                       # 세 블록 모두 생략
-    assert '✅ 카나리 일치' in body                       # 비교 로직은 그대로
-    assert cdr._spot_canary_visible(sides) is False
+    assert '  카나리:' not in body                       # 실린 블록 모두 생략
+    assert sides[0].canary_visible() is False
     assert fut.canary_visible() is False
-    assert warn is False
     # 숨겨도 판정 근거 자체는 남아 있다
     assert sides[0].canary == {'combined': 'ON'} and fut.canary == {'D_SMA42': 'ON'}
+    assert warn is True                                  # 선물이 LIVE 기대인데 dry 로 돌았다
 
 
 def test_canary_line_shown_when_off(tmp_path):
-    """OFF 인 날은 양쪽 블록에 표시 (일치해도 평상 상태가 아니다)."""
+    """OFF 인 날은 표시 — 평상 상태가 아니다."""
     sides = _spot_sides(tmp_path, canary_a='OFF', canary_b='OFF')
     body, _warn = cdr.build_report(DAY, sides)
 
-    assert body.count('  카나리: D_SMA42=OFF') == 2
-    assert '✅ 카나리 일치' in body
-    assert cdr._spot_canary_visible(sides) is True
-
-
-def test_canary_line_shown_when_sides_disagree(tmp_path):
-    """불일치면 양쪽 블록 모두 표시 — 어느 쪽이 어떤 상태였는지 봐야 한다."""
-    sides = _spot_sides(tmp_path, canary_a='ON', canary_b='OFF')
-    body, warn = cdr.build_report(DAY, sides)
-
-    assert '[업비트]' in body and '  카나리: D_SMA42=ON' in body
-    assert '  카나리: D_SMA42=OFF' in body
-    assert body.count('  카나리:') == 2
-    assert '⚠️ 카나리 불일치' in body
-    assert warn is True
-    assert cdr._spot_canary_visible(sides) is True
+    assert body.count('  카나리: D_SMA42=OFF') == 1      # 실린 블록(업비트)에만
+    assert sides[0].canary_visible() is True
+    assert '[바낸현물]' not in body                       # dry-run 축은 애초에 안 실린다
 
 
 def test_canary_line_shown_when_undeterminable(tmp_path):
-    """한쪽이 판별 불가('알 수 없음')면 양쪽 표시."""
-    skip_log = (f'[{DAY} 00:05:10] [0005abcd] Executor 시작 (dry_run=True)\n'
+    """카나리 판별 불가('알 수 없음')면 근거가 없다는 사실을 보여준다."""
+    skip_log = (f'[{DAY} 00:05:10] [0005abcd] Executor 시작 (dry_run=False)\n'
                 f'[{DAY} 00:05:12] [0005abcd] 새 봉 없음\n')
-    sides = _spot_sides(tmp_path)
-    path = _write(tmp_path, skip_log, 'executor_coin_binance.log')
-    b = cdr.SideResult('바낸현물', path)
-    b.parse(DAY)
-    sides[1] = b
-    assert b.canary == {}
+    up = cdr.SideResult('업비트', _write(tmp_path, skip_log, 'executor_coin.log'), True)
+    up.parse(DAY)
+    assert up.canary == {} and up.canary_visible() is True
 
-    body, warn = cdr.build_report(DAY, sides)
-    assert body.count('  카나리:') == 2
+    body, warn = cdr.build_report(DAY, [up])
+    assert body.count('  카나리:') == 1
     assert '  카나리: 알 수 없음' in body
-    assert '⚠️ 카나리: 한쪽 이상 판별 불가' in body
-    assert warn is True
-
-
-def test_canary_line_shown_when_one_side_missing(tmp_path):
-    """한쪽 미실행이면 실행된 쪽은 근거를 보여준다 (비교가 불가하므로)."""
-    sides = _spot_sides(tmp_path)
-    missing = cdr.SideResult('바낸현물', os.path.join(str(tmp_path), 'nope.log'))
-    missing.parse(DAY)
-    sides[1] = missing
-
-    body, warn = cdr.build_report(DAY, sides)
-    assert body.count('  카나리:') == 1               # 미실행 블록엔 애초에 줄이 없다
-    assert '[바낸현물] ⚠️ 미실행' in body
-    assert warn is True
-    assert cdr._spot_canary_visible(sides) is True
+    assert warn is False                                 # '새 봉 없음' 은 skip 등급
 
 
 def test_fut_canary_line_shown_when_off_or_unknown(tmp_path):
@@ -988,76 +966,176 @@ def test_fut_canary_line_hidden_when_all_on(tmp_path):
     assert '  타겟: BTC 33.3% (L2)' in body            # 나머지 줄은 그대로
 
 
-# ══════ 실행 모드(dry/LIVE)는 정합 판정 대상이 아니다 (2026-09-01 결정) ══════
-def _mode_lines(body):
-    return [ln for ln in body.split('\n') if ln.startswith('실행 모드')]
-
-
-def test_mode_upbit_live_vs_binance_dry_is_not_a_warning(tmp_path):
-    """운영 조합(업비트 LIVE + 바낸현물 dry) — 경고 없이 정보 줄만, 정합 판정은 그대로."""
-    sides = _spot_sides(tmp_path, dry=(False, True))
-    assert sides[0].dry_run is False and sides[1].dry_run is True
-    body, warn = cdr.build_report(DAY, sides)
-
-    assert 'LIVE 혼입' not in body                     # 옛 경고는 사라졌다
-    assert _mode_lines(body) == ['실행 모드: 업비트=LIVE, 바낸현물=dry-run']
-    assert '⚠️' not in body                            # 모드 차이로 어떤 경고도 뜨지 않는다
-    assert not body.startswith('⚠️')                   # 옛 코드가 맨 앞에 끼워 넣던 줄
-    assert warn is False
-    # 실제 비교 대상(전략 산출물)은 그대로 판정된다
-    assert '✅ 실행 쌍 정합' in body
-    assert '✅ 카나리 일치' in body
-    assert '✅ 코인 집합 일치' in body
-    assert '✅ 비중 일치' in body
-    assert '[업비트] 00:05:10 (LIVE)' in body          # 블록엔 모드가 계속 보인다
-
-
-def test_mode_both_dry_is_a_single_neutral_line(tmp_path):
-    """양쪽 같은 모드여도 ✅ 판정을 주지 않는다 — 중립 한 줄."""
+# ══════ LIVE 실행만 싣는다 (2026-09-09 결정 — dry-run 블록/현물 비교 섹션 제거) ══════
+def test_live_only_dry_binance_block_is_omitted(tmp_path):
+    """설정도 dry, 실행도 dry 인 바낸현물은 블록째 빠지고 업비트 LIVE 만 남는다."""
     sides = _spot_sides(tmp_path)
     body, warn = cdr.build_report(DAY, sides)
 
-    assert _mode_lines(body) == ['실행 모드: 양쪽 dry-run']
-    assert '✅ 실행 모드 일치' not in body
+    assert '[업비트] 00:05:10 (LIVE)' in body
+    assert '[바낸현물]' not in body
     assert warn is False
 
 
-def test_mode_upbit_dry_vs_binance_live_is_not_a_warning(tmp_path):
-    """역조합(업비트 dry + 바낸현물 LIVE)도 방향과 무관하게 정보 줄 하나뿐이다."""
-    sides = _spot_sides(tmp_path, dry=(True, False))
-    assert sides[0].dry_run is True and sides[1].dry_run is False
-    body, warn = cdr.build_report(DAY, sides)
-
-    assert _mode_lines(body) == ['실행 모드: 업비트=dry-run, 바낸현물=LIVE']
-    assert '⚠️' not in body
-    assert warn is False
-
-
-def test_mode_both_live_is_a_single_neutral_line(tmp_path):
-    """양쪽 LIVE 여도 판정하지 않는다 — 'LIVE 혼입' 경고는 완전히 사라졌다."""
-    sides = _spot_sides(tmp_path, dry=(False, False))
-    body, warn = cdr.build_report(DAY, sides)
-
-    assert _mode_lines(body) == ['실행 모드: 양쪽 LIVE']
-    assert 'LIVE 혼입' not in body
-    assert warn is False
-
-
-def test_mode_unknown_side_shows_question_mark_without_warning(tmp_path):
-    """모드 불명(None)은 '?' 로만 표시 — 이 줄 때문에 warn 이 서지 않는다.
-
-    SideResult 는 RE_START 로 블록을 잡으므로 ran=True 면서 dry_run=None 이 나올 수 없다.
-    파싱 품질 경고(FutResult 의 '실행 모드 불명')는 result_label 경로가 따로 담당하므로,
-    여기서는 비교 섹션의 표시 분기만 직접 값을 넣어 확인한다.
-    """
+def test_live_only_dry_fut_block_is_omitted(tmp_path):
+    """dry-run 선물은 --no-fut 없이도 안 실린다 (FUT_LIVE_EXPECTED=False)."""
+    assert cdr.FUT_LIVE_EXPECTED is False
     sides = _spot_sides(tmp_path)
-    sides[1].dry_run = None
+    fut = _fut(tmp_path, SAMPLE_BLOCK)          # live_expected=False + dry-run
+    body, warn = cdr.build_report(DAY, sides, fut)
+
+    assert '[선물]' not in body and 'run=20260831_090532' not in body
+    assert '[업비트]' in body
+    assert warn is False
+
+
+FUT_LIVE_LOG = (
+    "2026-08-31 00:05:32,178 INFO === 바이낸스 선물 매매 시작 (run_id=R1) ===\n"
+    "2026-08-31 00:05:45,000 INFO ORDER BUY BTCUSDT qty=0.010: NEW\n"
+    "2026-08-31 00:05:46,000 INFO 리밸런싱 완료: PV $100.00 → $101.50\n"
+    "2026-08-31 00:05:47,000 INFO === 완료 (15.0s) ===\n"
+)
+
+
+def test_live_only_unexpected_live_run_is_still_included(tmp_path):
+    """설정을 깜빡해도(live_expected=False) 실제로 LIVE 로 돈 실행은 숨기지 않는다."""
+    sides = _spot_sides(tmp_path, dry=(False, False), live=(True, False))
+    assert sides[1].live_expected is False and sides[1].dry_run is False
+    fut = _fut(tmp_path, FUT_LIVE_LOG)
+    assert fut.live_expected is False and fut.dry_run is False
+
+    body, warn = cdr.build_report(DAY, sides, fut)
+    assert '[바낸현물] 00:05:10 (LIVE)' in body
+    assert '[선물] 00:05:32 (LIVE)' in body
+    assert '실행 모드:' not in body              # LIVE 로 돌았으니 어긋남 경고는 없다
+    assert warn is False
+
+
+def test_live_only_expected_live_side_missing_still_warns(tmp_path):
+    """LIVE 로 기대하는 축은 미실행이어도 블록이 남아 '⚠️ 미실행' 로 드러난다."""
+    sides = _spot_sides(tmp_path)
+    missing = cdr.SideResult('업비트', os.path.join(str(tmp_path), 'nope.log'), True)
+    missing.parse(DAY)
+    sides[0] = missing
+    fut = cdr.FutResult('선물', os.path.join(str(tmp_path), 'nope.log'), True)
+    fut.parse(DAY)
+
+    body, warn = cdr.build_report(DAY, sides, fut)
+    assert '[업비트] ⚠️ 미실행' in body
+    assert '[선물] ⚠️ 미실행' in body
+    assert '표시할 LIVE 실행이 없습니다' not in body
+    assert warn is True
+
+
+def test_live_only_mode_mismatch_warns(tmp_path):
+    """LIVE 기대 축이 dry-run 으로 돌면 그 블록에 경고 한 줄 + warn."""
+    sides = _spot_sides(tmp_path, dry=(True, True))
     body, warn = cdr.build_report(DAY, sides)
 
-    assert _mode_lines(body) == ['실행 모드: 업비트=dry-run, 바낸현물=?']
-    assert '⚠️' not in body
+    assert '[업비트] 00:05:10 (dry)' in body
+    assert '  ⚠️ 실행 모드: LIVE 기대인데 dry-run 으로 실행됨' in body
+    assert body.count('실행 모드:') == 1
+    assert warn is True
+
+    # 모드 불명(None)도 같은 줄로 알린다
+    sides[0].dry_run = None
+    body2, warn2 = cdr.build_report(DAY, sides)
+    assert '  ⚠️ 실행 모드: LIVE 기대인데 불명 으로 실행됨' in body2
+    assert warn2 is True
+
+    # 미실행은 '⚠️ 미실행' 이 담당 — 모드 어긋남 줄을 중복으로 붙이지 않는다
+    missing = cdr.SideResult('업비트', os.path.join(str(tmp_path), 'nope.log'), True)
+    missing.parse(DAY)
+    body3, warn3 = cdr.build_report(DAY, [missing])
+    assert '⚠️ 미실행' in body3 and '실행 모드:' not in body3
+    assert warn3 is True
+
+
+def test_live_only_fut_mode_mismatch_warns(tmp_path):
+    """선물도 같은 규칙 — FUT_LIVE_EXPECTED 를 켠 뒤 dry 로 돌면 경고."""
+    fut = _fut(tmp_path, SAMPLE_BLOCK, live=True)
+    body, warn = cdr.build_report(DAY, [], fut)
+
+    assert '[선물] 09:05:32 (dry)' in body
+    assert '  ⚠️ 실행 모드: LIVE 기대인데 dry-run 으로 실행됨' in body
+    assert warn is True
+
+
+def test_live_only_nothing_to_show_warns(tmp_path):
+    """실을 LIVE 실행이 하나도 없으면 조용한 리포트로 끝내지 않는다."""
+    sides = _spot_sides(tmp_path, dry=(True, True), live=(False, False))
+    fut = _fut(tmp_path, SAMPLE_BLOCK)
+    body, warn = cdr.build_report(DAY, sides, fut)
+
+    assert body == ('📊 일일 운용 리포트 2026-08-31 (KST 기준)\n'
+                    '\n⚠️ 표시할 LIVE 실행이 없습니다 (dry-run 실행은 리포트에서 제외)')
+    assert warn is True
+
+
+def test_live_only_include_dry_restores_blocks(tmp_path):
+    """--include-dry 상당 — 필터를 끄면 dry 블록이 전부 돌아온다 (디버그용)."""
+    sides = _spot_sides(tmp_path, dry=(True, True), live=(False, False))
+    fut = _fut(tmp_path, SAMPLE_BLOCK)
+    body, warn = cdr.build_report(DAY, sides, fut, include_dry=True)
+
+    assert '[업비트] 00:05:10 (dry)' in body
+    assert '[바낸현물] 00:05:10 (dry)' in body
+    assert '[선물] 09:05:32 (dry)' in body
+    assert '표시할 LIVE 실행이 없습니다' not in body
     assert warn is False
-    assert cdr._mode_word(sides[0]) == 'dry-run' and cdr._mode_word(sides[1]) == '?'
+
+
+def test_live_only_compare_section_is_gone(tmp_path):
+    """비교 섹션의 흔적이 본문 어디에도 남지 않는다 (죽은 헬퍼도 함께 사라졌다)."""
+    sides = _spot_sides(tmp_path, dry=(False, False), live=(True, True))
+    fut = _fut(tmp_path, SAMPLE_BLOCK, live=True)
+    body, _warn = cdr.build_report(DAY, sides, fut, include_dry=True)
+
+    for gone in ('── 현물 비교 ──', '실행 쌍', '코인 집합', '비중 일치', '비중 오차',
+                 '카나리 일치', '카나리 불일치', 'state-ref 로 참조'):
+        assert gone not in body, gone
+    # '실행 모드:' 는 모드 어긋남 경고 문구로만 나온다
+    assert [ln for ln in body.split('\n') if '실행 모드:' in ln] == [
+        '  ⚠️ 실행 모드: LIVE 기대인데 dry-run 으로 실행됨'], body
+    for gone_attr in ('_spot_canary_visible', '_mode_word', '_time_gap_sec',
+                      '_in_cron_window', 'PAIR_MAX_GAP_SEC', 'WEIGHT_TOL',
+                      'CRON_WINDOW_KST', 'LOG_TZ_OFFSET_HOURS'):
+        assert not hasattr(cdr, gone_attr), gone_attr
+
+
+def test_live_only_tolerates_zero_or_one_side(tmp_path):
+    """sides 2축 전제를 없앴다 — 1개거나 비어도 예외 없이 렌더된다."""
+    one = _spot_sides(tmp_path)[:1]
+    body, warn = cdr.build_report(DAY, one)
+    assert '[업비트] 00:05:10 (LIVE)' in body and warn is False
+
+    # 빈 sides + 평가액 — 붙일 블록이 없어도 죽지 않는다
+    empty, ewarn = cdr.build_report(DAY, [], None,
+                                    {'value': 1.0, 'pct': 0.0, 'note': ''})
+    assert '표시할 LIVE 실행이 없습니다' in empty and ewarn is True
+    assert '평가액' not in empty
+
+    # 선물만 LIVE 인 날
+    fbody, fwarn = cdr.build_report(DAY, [], _fut(tmp_path, FUT_LIVE_LOG))
+    assert '[선물] 00:05:32 (LIVE)' in fbody and fwarn is False
+
+
+def test_live_only_upbit_value_line_stays_on_first_block(tmp_path):
+    """평가액 줄은 업비트 LIVE 블록에 그대로 붙고, 업비트 미실행일 때도 붙는다."""
+    sides = _spot_sides(tmp_path)
+    uv = {'value': 2100000.0, 'pct': 5.0, 'note': ''}
+    body, warn = cdr.build_report(DAY, sides, None, uv)
+    assert '[업비트] 00:05:10 (LIVE)' in body
+    assert '  평가액: 2,100,000원 (+5.0%)' in body
+    assert body.count('평가액:') == 1
+    assert warn is False
+
+    missing = cdr.SideResult('업비트', os.path.join(str(tmp_path), 'nope.log'), True)
+    missing.parse(DAY)
+    body2, warn2 = cdr.build_report(DAY, [missing] + sides[1:], None, uv)
+    assert '[업비트] ⚠️ 미실행' in body2
+    assert '  평가액: 2,100,000원 (+5.0%)' in body2
+    assert warn2 is True
 
 
 # ══════ 업비트 실계좌 평가액 + 원금 대비 등락률 (네트워크 전면 mock) ══════
@@ -1422,7 +1500,7 @@ def test_principal_zero_is_rejected(tmp_path):
 def test_upbit_value_shown_even_when_upbit_did_not_run(tmp_path):
     """업비트가 미실행이어도 평가액은 싣는다 — 그럴 때일수록 실계좌 확인이 급하다."""
     sides = _spot_sides(tmp_path)
-    missing = cdr.SideResult('업비트', os.path.join(str(tmp_path), 'nope.log'))
+    missing = cdr.SideResult('업비트', os.path.join(str(tmp_path), 'nope.log'), True)
     missing.parse(DAY)
     sides[0] = missing
 
@@ -1500,36 +1578,35 @@ SPOT_STATE_REF_FAIL = ('🚨 state-ref 참조 실패: 참조 파일 없음: trad
 SPOT_STATE_REF_DRIFT = '  📎 state-ref: drift 평가 보유비중 = 참조 last_target_snapshot 가정 (실잔고 아님)'
 
 
-def _spot_sides_with(tmp_path, extra_bn=(), dry=(True, True)):
+def _spot_sides_with(tmp_path, extra_bn=(), dry=(False, True), live=(True, False)):
     """바낸현물 쪽에만 로그 줄을 더한 현물 2축 (그 외는 _spot_sides 와 동일한 블록)."""
     sides = []
-    for (name, fname), dry_run in zip(SPOT_SIDES, dry):
+    for (name, fname), dry_run, live_exp in zip(SPOT_SIDES, dry, live):
         body = SPOT_LOG.format(day=DAY, rid='0005abcd', canary='',
                                tgt='BTC:33.3%, ETH:33.3%', cash='33.4', dry=dry_run)
         if name == '바낸현물' and extra_bn:
             head, rest = body.split('\n', 1)
             extra = ''.join(f'[{DAY} 00:05:10] [0005abcd] {m}\n' for m in extra_bn)
             body = head + '\n' + extra + rest
-        s = cdr.SideResult(name, _write(tmp_path, body, fname))
+        s = cdr.SideResult(name, _write(tmp_path, body, fname), live_exp)
         s.parse(DAY)
         sides.append(s)
     return sides
 
 
 def test_spot_state_ref_line_is_parsed_and_shown(tmp_path):
-    """참조 파일명을 읽어 모드 표기·안내줄에 싣는다 (경고는 아니다)."""
-    sides = _spot_sides_with(tmp_path, extra_bn=[SPOT_STATE_REF, SPOT_STATE_REF_DRIFT],
-                             dry=(False, True))
+    """참조 파일명을 읽어 블록 모드 표기에 싣는다 (경고는 아니다).
+
+    참조하는 축(바낸현물)은 dry-run 이라 평소 리포트엔 안 실린다 → include_dry 로 본다.
+    """
+    sides = _spot_sides_with(tmp_path, extra_bn=[SPOT_STATE_REF, SPOT_STATE_REF_DRIFT])
     assert sides[1].state_ref == 'trade_state.json', sides[1].state_ref
     assert sides[0].state_ref is None
-    body, warn = cdr.build_report(DAY, sides)
+    body, warn = cdr.build_report(DAY, sides, include_dry=True)
 
     assert '[바낸현물] 00:05:10 (dry(state-ref))' in body, body
-    assert '실행 모드: 업비트=LIVE, 바낸현물=dry-run(state-ref)' in body, body
-    assert ('ℹ 바낸현물 는 trade_state.json 를 state-ref 로 참조 → '
-            '타겟 일치는 파이프라인 검증이며 신호 독립 비교가 아님') in body, body
     # 같은 블록에서 state-ref 줄만 뺀 경우와 warn 판정이 같아야 한다 (정보 표시일 뿐)
-    _, base_warn = cdr.build_report(DAY, _spot_sides_with(tmp_path, dry=(False, True)))
+    _, base_warn = cdr.build_report(DAY, _spot_sides_with(tmp_path), include_dry=True)
     assert warn == base_warn, (warn, base_warn)
 
 
@@ -1540,7 +1617,7 @@ def test_spot_state_ref_failure_is_error(tmp_path):
     assert s.result_kind == 'error', (s.result_kind, s.result_label)
     assert 'state-ref' in s.result_label, s.result_label
     assert s.state_ref is None, s.state_ref      # 실패 라인을 참조 파일명으로 오인하지 않는다
-    body, warn = cdr.build_report(DAY, sides)
+    body, warn = cdr.build_report(DAY, sides, include_dry=True)
     assert warn is True
     assert 'state-ref 참조 실패' in body, body
 
@@ -1551,8 +1628,8 @@ def test_spot_state_ref_filename_with_space_is_captured(tmp_path):
             "members=['D_SMA42'], bar_counter=1234, last_bar=2026-08-30T00:00:00Z, snapshots=7)")
     sides = _spot_sides_with(tmp_path, extra_bn=[line, SPOT_STATE_REF_DRIFT])
     assert sides[1].state_ref == 'my trade state.json', sides[1].state_ref
-    body, _warn = cdr.build_report(DAY, sides)
-    assert 'ℹ 바낸현물 는 my trade state.json 를 state-ref 로 참조' in body, body
+    body, _warn = cdr.build_report(DAY, sides, include_dry=True)
+    assert '[바낸현물] 00:05:10 (dry(state-ref))' in body, body
 
 
 def test_spot_state_ref_failure_reason_keeps_state_ref_label(tmp_path):
@@ -1566,13 +1643,13 @@ def test_spot_state_ref_failure_reason_keeps_state_ref_label(tmp_path):
 
 
 def test_spot_report_without_state_ref_is_unchanged(tmp_path):
-    """state-ref 줄이 없으면 출력은 종전과 완전히 같다."""
+    """state-ref 줄이 없으면 모드 표기에 접미가 붙지 않는다."""
     sides = _spot_sides(tmp_path)
     assert all(s.state_ref is None for s in sides)
-    body, warn = cdr.build_report(DAY, sides)
+    body, warn = cdr.build_report(DAY, sides, include_dry=True)
     assert 'state-ref' not in body and 'ℹ' not in body, body
+    assert '[업비트] 00:05:10 (LIVE)' in body, body
     assert '[바낸현물] 00:05:10 (dry)' in body, body
-    assert '실행 모드: 양쪽 dry-run' in body, body
     assert warn is False
 
 
